@@ -1,20 +1,40 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
+// CONFIG — coloque seus dados aqui depois
+const CHATWOOT_URL = "https://chat.smsnet.com.br";
+const ACCOUNT_ID = "SEU_ACCOUNT_ID";
+const API_TOKEN = "SEU_TOKEN";
+
 app.get("/", (req, res) => {
-  res.status(200).send("OK - webhook online");
+  res.send("Bot online 🚀");
 });
 
-// Endpoint que você vai colocar no Chatwoot
-app.post("/chatwoot-webhook", (req, res) => {
-  // Loga o evento para você ver no Render
-  console.log("Webhook recebido:", JSON.stringify(req.body, null, 2));
+app.post("/chatwoot-webhook", async (req, res) => {
+  console.log("Webhook recebido:", req.body.event);
 
-  // IMPORTANTE: sempre responder rápido pro Chatwoot não reenviar
-  return res.status(200).json({ received: true });
+  if (req.body.event === "message_created") {
+    const conversationId = req.body.id;
+
+    await fetch(
+      `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          api_access_token: API_TOKEN
+        },
+        body: JSON.stringify({
+          content: "🤖 Olá! Sou o bot automático. Como posso ajudar?"
+        })
+      }
+    );
+  }
+
+  res.status(200).send("ok");
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
+app.listen(process.env.PORT || 3000);
