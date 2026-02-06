@@ -3,52 +3,68 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ENV (Render)
-const CHATWOOT_URL = process.env.CHATWOOT_URL?.replace(/\/$/, ""); // remove barra final
+/**
+ * ENV (Render):
+ * CHATWOOT_URL=https://chat.smsnet.com.br
+ * CHATWOOT_ACCOUNT_ID=195
+ * CHATWOOT_API_TOKEN=xxxx
+ */
+const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN;
 
-function requireEnv() {
+// --- valida ENV logo no boot (evita rodar “meio quebrado”)
+function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
   if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
   if (!CHATWOOT_API_TOKEN) missing.push("CHATWOOT_API_TOKEN");
-  return missing;
+
+  if (missing.length) {
+    console.error("Faltando ENV:", missing.join(" / "));
+    return false;
+  }
+  return true;
+}
+
+function buildAuthHeaders() {
+  // Tenta os 2 padrões mais comuns (instalações variam)
+  return {
+    "Content-Type": "application/json",
+    api_access_token: CHATWOOT_API_TOKEN,
+    Authorization: `Bearer ${CHATWOOT_API_TOKEN}`,
+  };
 }
 
 async function chatwootFetch(path, { method = "GET", body } = {}) {
   const url = `${CHATWOOT_URL}${path}`;
 
-  // Alguns setups aceitam api_access_token; outros aceitam Bearer.
-  // Enviamos os dois para maximizar compatibilidade.
-  const headers = {
-    "Content-Type": "application/json",
-    api_access_token: CHATWOOT_API_TOKEN,
-    Authorization: `Bearer ${CHATWOOT_API_TOKEN}`,
-  };
-
-  const resp = await fetch(url, {
+  const res = await fetch(url, {
     method,
-    headers,
+    headers: buildAuthHeaders(),
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  const text = await resp.text();
-  let data;
+  const text = await res.text();
+  let json = null;
   try {
-    data = JSON.parse(text);
+    json = text ? JSON.parse(text) : null;
   } catch {
-    data = text;
+    // algumas instalações podem responder HTML; manteremos text
   }
 
-  if (!resp.ok) {
-    const err = new Error(`Chatwoot API ${resp.status}`);
-    err.status = resp.status;
-    err.body = data;
+  if (!res.ok) {
+    const err = {
+      ok: false,
+      status: res.status,
+      url,
+      body: json || text,
+      message: `Chatwoot API ${res.status}`,
+    };
     throw err;
   }
 
-  return data;
+  return json || { ok: true };
 }
 
 async function sendMessageToConversation(conversationId, content) {
@@ -56,85 +72,65 @@ async function sendMessageToConversation(conversationId, content) {
     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
     {
       method: "POST",
-      body: {
-        content,
-        message_type: "outgoing",
-        private: false,
-      },
+      body: { content },
     }
   );
 }
 
-app.get("/", (req, res) => {
-  res.send("Bot online 🚀");
-});
+// Endpoint de saúde
+app.get("/", (req, res) => res.send("Bot online 🚀"));
 
-// ROTA DE TESTE: valida se o token funciona mesmo
+// Teste manual: valida se o token autentica
 app.get("/test-chatwoot", async (req, res) => {
-  const missing = requireEnv();
-  if (missing.length) {
-    return res.status(500).json({ ok: false, error: `Faltando ENV: ${missing.join(", ")}` });
-  }
-
   try {
+    if (!assertEnv()) return res.status(500).json({ ok: false, error: "Missing ENV" });
     const profile = await chatwootFetch("/api/v1/profile");
-    return res.json({ ok: true, profile });
+    res.json({ ok: true, profile });
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      status: e.status,
-      body: e.body,
-      message: e.message,
-      tip:
-        "Se continuar 401 aqui, o token não está sendo aceito pela API (token/tipo/URL/proxy).",
-    });
+    res.status(500).json(e);
   }
 });
 
+// Webhook do Chatwoot
 app.post("/chatwoot-webhook", async (req, res) => {
-  const event = req.body?.event;
-  console.log("Webhook recebido:", event);
-
-  // sempre responde 200 rápido (evita retry)
-  res.status(200).send("ok");
-
-  const missing = requireEnv();
-  if (missing.length) {
-    console.log("Faltando ENV:", missing.join(", "));
-    return;
-  }
-
   try {
+    if (!assertEnv()) return res.status(500).send("Missing ENV");
+
+    const event = req.body?.event;
+    console.log("Webhook recebido:", event);
+
+    // Responde logo para o Chatwoot não reenviar por timeout
+    res.status(200).send("ok");
+
     if (event !== "message_created") return;
 
-    // Evita loop: só responde quando for mensagem INCOMING do contato
-    const messageType = req.body?.message_type; // "incoming" ou "outgoing"
-    const senderType = req.body?.sender?.type;  // "contact", "user", "agent_bot", etc.
-
-    if (messageType !== "incoming" || senderType !== "contact") {
-      console.log("Ignorando message_type/sender:", { messageType, senderType });
+    // Evita loop: não responder mensagens do próprio sistema/agente/bot
+    const messageType = req.body?.message_type; // incoming / outgoing / template (varia)
+    if (messageType && messageType !== "incoming") {
+      console.log("Ignorando message_type:", messageType);
       return;
     }
 
-    // Conversation ID correto vem dentro de conversation.id (não é o req.body.id)
-    const conversationId =
-      req.body?.conversation?.id || req.body?.conversation_id;
-
+    // CORRETO: conversationId vem dentro de conversation.id
+    const conversationId = req.body?.conversation?.id;
     if (!conversationId) {
-      console.log("Não achei conversationId no payload. Keys:", Object.keys(req.body || {}));
+      console.log("Sem conversation.id no payload.");
       return;
     }
+
+    // (Opcional) Evitar responder mensagens automáticas / privadas
+    if (req.body?.private) return;
 
     await sendMessageToConversation(
       conversationId,
       "🤖 Olá! Sou o bot automático. Como posso ajudar?"
     );
 
-    console.log("Resposta enviada na conversa:", conversationId);
+    console.log("Mensagem enviada na conversa:", conversationId);
   } catch (e) {
-    console.log("Erro no webhook:", e.status, e.body || e.message);
+    console.error("Erro no webhook:", e);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Rodando na porta", PORT));
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Rodando na porta", port));
