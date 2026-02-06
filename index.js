@@ -1,56 +1,27 @@
 import express from "express";
 
-// Node 18+ tem fetch nativo. Se der erro no seu ambiente, me avise.
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-
-/**
- * ENV no Render (configure em Environment Variables):
- *
- * CHATWOOT_URL=https://chat.smsnet.com.br
- * CHATWOOT_ACCOUNT_ID=195
- *
- * # Opção A (recomendada - a que funcionou no seu curl):
- * CW_ACCESS_TOKEN=xxxx
- * CW_CLIENT=xxxx
- * CW_UID=anderson_mikel@hotmail.com
- * CW_TOKEN_TYPE=Bearer   (opcional, default Bearer)
- *
- * # (Opcional) Opção B (token do perfil - no seu caso deu 401):
- * CHATWOOT_API_TOKEN=xxxx
- *
- * # (Opcional) Se você quiser o bot logar e também conseguir renovar tokens via login:
- * CW_EMAIL=anderson_mikel@hotmail.com
- * CW_PASSWORD=xxxx
- */
 
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 
-// Opção B (token “Perfil/Settings”)
-const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || "";
-
-// Opção A (tokens do DevTools / auth/sign_in)
-let CW_ACCESS_TOKEN = process.env.CW_ACCESS_TOKEN || "";
-let CW_CLIENT = process.env.CW_CLIENT || "";
-let CW_UID = process.env.CW_UID || "";
+// Preferir tokens do login (devise token auth)
+let CW_ACCESS_TOKEN =
+  process.env.CW_ACCESS_TOKEN || process.env.ACCESS_TOKEN || "";
+let CW_CLIENT = process.env.CW_CLIENT || process.env.CLIENT || "";
+let CW_UID = process.env.CW_UID || process.env.UID || "";
 let CW_TOKEN_TYPE = process.env.CW_TOKEN_TYPE || "Bearer";
 
-const CW_EMAIL = process.env.CW_EMAIL || "";
-const CW_PASSWORD = process.env.CW_PASSWORD || "";
-
-// ========= Helpers =========
+// Fallback (geralmente NÃO funciona na sua instalação)
+const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || "";
 
 function assertEnvBasic() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
   if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
-
-  if (missing.length) {
-    console.error("❌ Faltando ENV:", missing.join(" / "));
-    return false;
-  }
-  return true;
+  if (missing.length) console.error("❌ Faltando ENV:", missing.join(" / "));
+  return missing.length === 0;
 }
 
 function hasHeaderTokens() {
@@ -58,18 +29,17 @@ function hasHeaderTokens() {
 }
 
 function buildAuthHeaders() {
-  // Preferir o modo A (header tokens) porque foi o único que autenticou no seu ambiente.
   if (hasHeaderTokens()) {
     return {
       "Content-Type": "application/json",
       "access-token": CW_ACCESS_TOKEN,
       client: CW_CLIENT,
       uid: CW_UID,
-      "token-type": CW_TOKEN_TYPE || "Bearer",
+      "token-type": CW_TOKEN_TYPE,
     };
   }
 
-  // Fallback: modo B (api_access_token / Authorization)
+  // fallback
   const headers = { "Content-Type": "application/json" };
   if (CHATWOOT_API_TOKEN) {
     headers["api_access_token"] = CHATWOOT_API_TOKEN;
@@ -80,10 +50,21 @@ function buildAuthHeaders() {
 
 async function chatwootFetch(path, { method = "GET", body } = {}) {
   const url = `${CHATWOOT_URL}${path}`;
+  const headers = buildAuthHeaders();
+
+  // log seguro (não imprime token completo)
+  console.log("🔐 Auth mode:", hasHeaderTokens() ? "header-tokens" : "api_token");
+  if (hasHeaderTokens()) {
+    console.log("🔐 Using uid/client:", {
+      uid: CW_UID,
+      client: CW_CLIENT?.slice(0, 6) + "…",
+      accessToken: CW_ACCESS_TOKEN?.slice(0, 6) + "…",
+    });
+  }
 
   const res = await fetch(url, {
     method,
-    headers: buildAuthHeaders(),
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -91,19 +72,16 @@ async function chatwootFetch(path, { method = "GET", body } = {}) {
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch {
-    // pode vir HTML em erros
-  }
+  } catch {}
 
   if (!res.ok) {
-    const err = {
+    throw {
       ok: false,
       status: res.status,
       url,
       body: json || text,
       message: `Chatwoot API ${res.status}`,
     };
-    throw err;
   }
 
   return json || { ok: true };
@@ -114,85 +92,26 @@ async function sendMessageToConversation(conversationId, content) {
     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
     {
       method: "POST",
-      body: { content, message_type: "outgoing" }, // alguns chatwoot ignoram, mas não atrapalha
+      body: { content, message_type: "outgoing" },
     }
   );
 }
 
-// ========= (Opcional) renovar tokens via login =========
-// Isso ajuda se você quiser automatizar e não depender do DevTools.
-async function signInAndSetTokens() {
-  if (!CW_EMAIL || !CW_PASSWORD) {
-    throw new Error("CW_EMAIL/CW_PASSWORD não configurados para sign-in.");
-  }
+app.get("/", (req, res) => res.send("Bot online 🚀"));
 
-  const url = `${CHATWOOT_URL}/auth/sign_in`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: CW_EMAIL, password: CW_PASSWORD }),
-  });
-
-  // pega headers de autenticação
-  const accessToken = res.headers.get("access-token");
-  const client = res.headers.get("client");
-  const uid = res.headers.get("uid");
-  const tokenType = res.headers.get("token-type") || "Bearer";
-
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!res.ok || !accessToken || !client || !uid) {
-    throw {
-      ok: false,
-      status: res.status,
-      url,
-      body: json || text,
-      message: "Falha no sign-in /auth/sign_in",
-    };
-  }
-
-  // seta em memória (vale até reiniciar container)
-  CW_ACCESS_TOKEN = accessToken;
-  CW_CLIENT = client;
-  CW_UID = uid;
-  CW_TOKEN_TYPE = tokenType;
-
-  console.log("✅ Sign-in OK. Tokens atualizados em memória:", {
-    accessToken: CW_ACCESS_TOKEN,
-    client: CW_CLIENT,
-    uid: CW_UID,
-    tokenType: CW_TOKEN_TYPE,
-  });
-
-  return { ok: true, accessToken, client, uid, tokenType };
-}
-
-// ========= Rotas =========
-
-app.get("/", (req, res) => {
-  res.send("Bot online 🚀");
-});
-
-// Debug rápido: mostra se ENV principal está ok (sem vazar tokens)
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    hasBasicEnv: assertEnvBasic(),
+    basicEnvOk: assertEnvBasic(),
     hasHeaderTokens: hasHeaderTokens(),
-    url: CHATWOOT_URL,
     accountId: CHATWOOT_ACCOUNT_ID,
+    url: CHATWOOT_URL,
   });
 });
 
-// Testa autenticação com Chatwoot
 app.get("/test-chatwoot", async (req, res) => {
   try {
     if (!assertEnvBasic()) return res.status(500).json({ ok: false, error: "Missing basic ENV" });
-
     const profile = await chatwootFetch("/api/v1/profile");
     res.json({ ok: true, profile });
   } catch (e) {
@@ -200,93 +119,62 @@ app.get("/test-chatwoot", async (req, res) => {
   }
 });
 
-// (Opcional) gerar tokens via login (não salva em ENV; só em memória)
-app.post("/auth-refresh", async (req, res) => {
+// Teste direto de envio: /test-send?conv=11419
+app.get("/test-send", async (req, res) => {
   try {
     if (!assertEnvBasic()) return res.status(500).json({ ok: false, error: "Missing basic ENV" });
-    const r = await signInAndSetTokens();
-    res.json({ ok: true, ...r });
+    const conv = req.query.conv;
+    if (!conv) return res.status(400).json({ ok: false, error: "Informe ?conv=ID" });
+
+    const sent = await sendMessageToConversation(conv, "✅ teste envio direto do bot (/test-send)");
+    res.json({ ok: true, sent });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || e });
+    res.status(500).json(e);
   }
 });
 
-// Webhook do Chatwoot
 app.post("/chatwoot-webhook", async (req, res) => {
-  // Responde logo para o Chatwoot não reenviar por timeout
   res.status(200).send("ok");
 
   try {
-    if (!assertEnvBasic()) {
-      console.error("❌ Missing basic ENV");
-      return;
-    }
+    if (!assertEnvBasic()) return;
 
-    // LOG “à prova de bala” (não remove até funcionar 100%)
-    console.log("📩 WEBHOOK HIT", new Date().toISOString());
-    console.log("RAW BODY:", JSON.stringify(req.body));
+    console.log("📩 ACESSO DO WEBHOOK", new Date().toISOString());
+    console.log("CORPO BRUTO:", JSON.stringify(req.body));
 
     const event = req.body?.event;
     console.log("event:", event);
 
-    // Aceitar os eventos principais
-    const allowed = new Set(["message_created", "message_updated", "conversation_created"]);
-    if (!allowed.has(event)) {
-      console.log("Ignorando event:", event);
-      return;
-    }
+    if (event !== "message_created") return;
 
-    // Pegar conversationId do jeito mais compatível
     const conversationId =
       req.body?.conversation?.id ||
       req.body?.conversation_id ||
       req.body?.id;
 
     if (!conversationId) {
-      console.log("Sem conversationId no payload.");
+      console.log("Sem conversationId no payload");
       return;
     }
 
-    // Evitar loop:
-    // Em instalações como a sua, message_type costuma ser número:
-    // 0 = incoming (cliente)
-    // 1 = outgoing (agente/bot)
-    const messageType = req.body?.message_type;
-
-    // Se vier string, tratar também.
-    const isIncoming =
-      messageType === 0 ||
-      messageType === "incoming" ||
-      messageType === "Incoming" ||
-      req.body?.incoming === true;
-
+    // incoming pode vir como 0 ou "incoming"
+    const mt = req.body?.message_type;
+    const isIncoming = mt === 0 || mt === "incoming";
     if (!isIncoming) {
-      console.log("Ignorando (não incoming). message_type:", messageType);
+      console.log("Ignorando (não incoming). message_type:", mt);
       return;
     }
 
-    // Não responder mensagens privadas
-    if (req.body?.private === true) {
-      console.log("Ignorando mensagem privada");
-      return;
-    }
+    // evita privadas
+    if (req.body?.private === true) return;
 
-    // Evita responder “update” repetido sem conteúdo (depende do provedor)
-    const content = req.body?.content || req.body?.message?.content || "";
-    if (!content || !String(content).trim()) {
-      console.log("Ignorando evento sem conteúdo.");
-      return;
-    }
+    const content = (req.body?.content || "").trim();
+    if (!content) return;
 
-    // Resposta do bot
     const reply = "🤖 Olá! Sou o bot automático. Como posso ajudar?";
-
     const sent = await sendMessageToConversation(conversationId, reply);
 
-    console.log("✅ Resposta enviada", {
-      conversationId,
-      sentId: sent?.id,
-    });
+    console.log("✅ Resposta enviada", { conversationId, sentId: sent?.id });
   } catch (e) {
     console.error("❌ Erro no webhook:", e);
   }
