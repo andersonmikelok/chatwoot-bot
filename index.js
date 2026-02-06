@@ -3,63 +3,82 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ENV (Render)
-const CHATWOOT_URL = process.env.CHATWOOT_URL;                 // ex: https://chat.smsnet.com.br
-const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;   // ex: 195
+const CHATWOOT_URL = process.env.CHATWOOT_URL;                 // https://chat.smsnet.com.br
+const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;   // 195
 const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN;     // token do Perfil > Token de acesso
 
-function requiredEnv() {
+function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
   if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
   if (!CHATWOOT_API_TOKEN) missing.push("CHATWOOT_API_TOKEN");
-  return missing;
+  if (missing.length) throw new Error("Faltando ENV: " + missing.join(", "));
+}
+
+function buildHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    // ✅ Forma oficial do Chatwoot (mas pode ser removida pelo proxy)
+    "api_access_token": CHATWOOT_API_TOKEN,
+    // ✅ Algumas instalações aceitam bearer
+    "Authorization": `Bearer ${CHATWOOT_API_TOKEN}`,
+  };
+}
+
+function withTokenInQuery(url) {
+  const u = new URL(url);
+  // ✅ Fallback que costuma passar por qualquer proxy
+  u.searchParams.set("api_access_token", CHATWOOT_API_TOKEN);
+  return u.toString();
 }
 
 app.get("/", (req, res) => res.status(200).send("Bot online 🚀"));
 
+// ✅ Teste rápido de autenticação
+app.get("/test-chatwoot", async (req, res) => {
+  try {
+    assertEnv();
+    const url = withTokenInQuery(`${CHATWOOT_URL}/api/v1/profile`);
+    const resp = await fetch(url, { headers: buildHeaders() });
+    const text = await resp.text();
+    return res.status(200).json({ status: resp.status, body: text });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
 app.post("/chatwoot-webhook", async (req, res) => {
   try {
-    const missing = requiredEnv();
-    if (missing.length) {
-      console.log("Faltando ENV:", missing.join(", "));
-      return res.status(200).send("ok");
-    }
+    assertEnv();
 
     const event = req.body?.event;
     console.log("Webhook recebido:", event);
 
-    if (event !== "message_created") {
-      return res.status(200).send("ok");
-    }
+    if (event !== "message_created") return res.status(200).send("ok");
 
-    // Evita loop: só responde quando a mensagem for do cliente (incoming)
-    const messageType = req.body?.message_type; // "incoming" | "outgoing"
+    // evita loop: só responde mensagem do cliente
+    const messageType = req.body?.message_type; // incoming | outgoing | template ...
     if (messageType !== "incoming") {
       console.log("Ignorando message_type:", messageType);
       return res.status(200).send("ok");
     }
 
-    // ⚠️ No webhook do Chatwoot, em message_created:
-    // req.body.conversation?.id costuma ser o ID da conversa (o req.body.id pode ser o ID da mensagem)
+    // no Chatwoot, esse costuma ser o ID da conversa
     const conversationId = req.body?.conversation?.id;
     if (!conversationId) {
-      console.log("Não achei conversation.id no payload. Keys:", Object.keys(req.body || {}));
+      console.log("Sem conversation.id no payload");
       return res.status(200).send("ok");
     }
 
-    const url = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
+    const base = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
+    const url = withTokenInQuery(base);
 
     const resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        // ✅ evita problema de proxy removendo api_access_token
-        "Authorization": `Bearer ${CHATWOOT_API_TOKEN}`,
-      },
+      headers: buildHeaders(),
       body: JSON.stringify({
-        content: "🤖 Olá! Sou o bot automático. Como posso ajudar?"
+        content: "🤖 Olá! Sou o bot automático. Como posso ajudar?",
       }),
     });
 
@@ -67,7 +86,7 @@ app.post("/chatwoot-webhook", async (req, res) => {
     if (!resp.ok) {
       console.log("Chatwoot API erro:", resp.status, text);
     } else {
-      console.log("Mensagem enviada com sucesso:", text);
+      console.log("Mensagem enviada OK:", text);
     }
 
     return res.status(200).send("ok");
