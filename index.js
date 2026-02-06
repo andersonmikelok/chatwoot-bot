@@ -3,125 +3,113 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ENV obrigatórias
-const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/$/, "");
+// Render ENV VARS (obrigatório)
+const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN;
 
-// Opcional
-const BOT_NAME = process.env.BOT_NAME || "Bot IA";
-const BOT_REPLY =
-  process.env.BOT_REPLY || "🤖 Olá! Sou o bot automático. Como posso ajudar?";
-
-// Validação simples de ENV
+// Validação de ENV
 function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
   if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
   if (!CHATWOOT_API_TOKEN) missing.push("CHATWOOT_API_TOKEN");
   if (missing.length) {
-    console.log("Faltando ENV:", missing.join(" / "));
-    return false;
+    throw new Error(`Faltando ENV: ${missing.join(" / ")}`);
   }
-  return true;
 }
 
-app.get("/", (req, res) => res.send("Bot online 🚀"));
+// Helper: chamada à API do Chatwoot
+async function chatwootRequest(path, { method = "GET", body } = {}) {
+  assertEnv();
 
-/**
- * Teste rápido do token (abra no navegador):
- * https://SEU-SERVICO.onrender.com/test-chatwoot
- *
- * Se retornar 200, token/URL ok.
- * Se retornar 401, o Chatwoot não aceitou o token.
- */
-app.get("/test-chatwoot", async (req, res) => {
-  if (!assertEnv()) return res.status(500).json({ error: "ENV faltando" });
+  const url = `${CHATWOOT_URL}${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      // Header correto do Chatwoot
+      api_access_token: CHATWOOT_API_TOKEN,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
 
-  // Endpoint leve para validar autenticação
-  const url = `${CHATWOOT_URL}/api/v1/profile`;
-
+  const text = await res.text();
+  let data;
   try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: {
-        api_access_token: CHATWOOT_API_TOKEN,
-      },
-    });
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
-    const body = await r.text();
-    return res.status(200).json({ status: r.status, body });
+  if (!res.ok) {
+    const err = new Error(`Chatwoot API ${res.status}`);
+    err.status = res.status;
+    err.body = data;
+    throw err;
+  }
+
+  return data;
+}
+
+app.get("/", (req, res) => {
+  res.send("Bot online 🚀");
+});
+
+// Rota de teste: valida se URL + token estão aceitos
+app.get("/test-chatwoot", async (req, res) => {
+  try {
+    const me = await chatwootRequest(`/api/v1/profile`, { method: "GET" });
+    res.json({ ok: true, profile: me });
   } catch (e) {
-    return res.status(500).json({ error: String(e) });
+    res.status(500).json({ ok: false, status: e.status, body: e.body, message: e.message });
   }
 });
 
-async function sendMessageToConversation(conversationId, content) {
-  const url = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      api_access_token: CHATWOOT_API_TOKEN,
-    },
-    body: JSON.stringify({
-      content,
-      message_type: "outgoing",
-      private: false,
-    }),
-  });
-
-  const text = await r.text();
-  if (!r.ok) {
-    console.log("Chatwoot API erro:", r.status, text);
-    const err = new Error(`Chatwoot API ${r.status}`);
-    err.status = r.status;
-    err.body = text;
-    throw err;
-  }
-  return text;
-}
-
 app.post("/chatwoot-webhook", async (req, res) => {
-  // sempre responder rápido pro Chatwoot
-  res.status(200).send("ok");
-
   try {
-    if (!assertEnv()) return;
-
-    const payload = req.body;
-    const event = payload?.event;
-
+    const event = req.body?.event;
     console.log("Webhook recebido:", event);
 
-    // Queremos responder apenas quando for mensagem criada
+    // Responde rápido pro Chatwoot não re-tentar
+    res.status(200).send("ok");
+
     if (event !== "message_created") return;
 
-    // Evita loop: ignora mensagens que o próprio bot/agente envia
-    const messageType = payload?.message_type; // incoming/outgoing/template...
+    // Ignora mensagens "outgoing" (geradas por agente/bot) pra não entrar em loop
+    const messageType = req.body?.message_type; // incoming / outgoing / template etc
     if (messageType !== "incoming") {
       console.log("Ignorando message_type:", messageType);
       return;
     }
 
-    // Pega conversation_id de forma robusta (depende do payload)
+    // ID correto da conversa (não use req.body.id aqui)
     const conversationId =
-      payload?.conversation?.id ||
-      payload?.conversation_id ||
-      payload?.conversationId;
+      req.body?.conversation?.id ||
+      req.body?.conversation_id;
 
     if (!conversationId) {
-      console.log("Não achei conversationId no payload.");
+      console.log("Webhook sem conversationId. Payload keys:", Object.keys(req.body || {}));
       return;
     }
 
-    await sendMessageToConversation(conversationId, BOT_REPLY);
-    console.log(`${BOT_NAME} respondeu na conversa`, conversationId);
-  } catch (err) {
-    console.log("Erro no webhook:", err?.status || "", err?.body || "", err);
+    // Exemplo de resposta automática
+    await chatwootRequest(
+      `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: "🤖 Olá! Sou o bot automático. Como posso ajudar?",
+        },
+      }
+    );
+
+    console.log("Mensagem enviada para conversa:", conversationId);
+  } catch (e) {
+    console.log("Erro no webhook:", e.status, e.body || e.message);
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Rodando na porta", PORT));
+// Render usa PORT; local pode usar 3000
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Rodando na porta", port));
