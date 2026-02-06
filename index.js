@@ -5,64 +5,57 @@ app.use(express.json({ limit: "2mb" }));
 
 /**
  * ENV (Render)
+ * CHATWOOT_URL=https://chat.smsnet.com.br
+ * CHATWOOT_ACCOUNT_ID=195
  *
- * Chatwoot:
- *  CHATWOOT_URL=https://chat.smsnet.com.br
- *  CHATWOOT_ACCOUNT_ID=195
+ * // Auth por sessão (recomendado no seu caso, pois funcionou):
+ * CW_UID=anderson_mikel@hotmail.com
+ * CW_PASSWORD=*****
+ * CW_ACCESS_TOKEN=...
+ * CW_CLIENT=...
+ * CW_TOKEN_TYPE=Bearer
  *
- *  (opção A - recomendado) CHATWOOT_API_TOKEN=xxxx  // token de API do Chatwoot (pessoal)
- *
- *  (opção B) CW_UID=anderson_mikel@hotmail.com
- *            CW_PASSWORD=xxxx
- *            (e opcionalmente, se você quiser fixar)
- *            CW_ACCESS_TOKEN=...
- *            CW_CLIENT=...
- *            CW_TOKEN_TYPE=Bearer
- *
- * OpenAI:
- *  OPENAI_API_KEY=sk-...
- *  OPENAI_MODEL=gpt-5-mini
+ * // OpenAI:
+ * OPENAI_API_KEY=sk-...
+ * OPENAI_MODEL=gpt-5.2   (opcional; pode usar gpt-5 mini pra economizar)
  */
 
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
-const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || "";
-const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || "";
+const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 
-const CW_UID = process.env.CW_UID || "";
-const CW_PASSWORD = process.env.CW_PASSWORD || "";
+const CW_UID = process.env.CW_UID;
+const CW_PASSWORD = process.env.CW_PASSWORD;
 
 let CW_ACCESS_TOKEN = process.env.CW_ACCESS_TOKEN || "";
 let CW_CLIENT = process.env.CW_CLIENT || "";
 let CW_TOKEN_TYPE = process.env.CW_TOKEN_TYPE || "Bearer";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
-function assertEnvBasics() {
+function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
   if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
   if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
 
+  if (!CW_ACCESS_TOKEN || !CW_CLIENT) {
+    // ok se tiver uid/password para renovar automaticamente
+    if (!CW_UID) missing.push("CW_UID (ou CW_ACCESS_TOKEN/CW_CLIENT)");
+    if (!CW_PASSWORD) missing.push("CW_PASSWORD (ou CW_ACCESS_TOKEN/CW_CLIENT)");
+  }
+
   if (missing.length) {
-    console.error("❌ Faltando ENV:", missing.join(" / "));
+    console.error("Faltando ENV:", missing.join(" / "));
     return false;
   }
   return true;
 }
 
-function hasChatwootAuth() {
-  // Preferência: API token; senão tokens de login; senão email/senha (para logar)
-  if (CHATWOOT_API_TOKEN) return true;
-  if (CW_ACCESS_TOKEN && CW_CLIENT && CW_UID) return true;
-  if (CW_UID && CW_PASSWORD) return true;
-  return false;
-}
-
-// ---------- Chatwoot auth: login via /auth/sign_in (se precisar) ----------
+// ----------------------- Chatwoot auth -----------------------
 async function chatwootSignIn() {
   if (!CW_UID || !CW_PASSWORD) {
-    throw new Error("CW_UID/CW_PASSWORD não configurados para login.");
+    throw new Error("Sem CW_UID/CW_PASSWORD para renovar tokens.");
   }
 
   const url = `${CHATWOOT_URL}/auth/sign_in`;
@@ -76,7 +69,9 @@ async function chatwootSignIn() {
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   if (!res.ok) {
     throw {
@@ -84,62 +79,71 @@ async function chatwootSignIn() {
       status: res.status,
       url,
       body: json || text,
-      message: `Chatwoot sign_in ${res.status}`,
+      message: "Falha no /auth/sign_in",
     };
   }
 
-  // Headers retornam access-token, client, token-type, uid
-  CW_ACCESS_TOKEN = res.headers.get("access-token") || CW_ACCESS_TOKEN;
-  CW_CLIENT = res.headers.get("client") || CW_CLIENT;
-  CW_TOKEN_TYPE = res.headers.get("token-type") || CW_TOKEN_TYPE;
+  // Tokens vêm nos headers
+  const accessToken = res.headers.get("access-token") || "";
+  const client = res.headers.get("client") || "";
+  const tokenType = res.headers.get("token-type") || "Bearer";
 
-  console.log("✅ Login Chatwoot OK. Tokens atualizados.", {
+  if (!accessToken || !client) {
+    throw new Error("Sign-in OK, mas não retornou access-token/client.");
+  }
+
+  CW_ACCESS_TOKEN = accessToken;
+  CW_CLIENT = client;
+  CW_TOKEN_TYPE = tokenType;
+
+  console.log("🔄 Tokens renovados via sign_in:", {
     uid: CW_UID,
-    client: CW_CLIENT ? CW_CLIENT.slice(0, 6) + "…" : "",
-    accessToken: CW_ACCESS_TOKEN ? CW_ACCESS_TOKEN.slice(0, 6) + "…" : "",
+    client: CW_CLIENT.slice(0, 6) + "…",
+    access: CW_ACCESS_TOKEN.slice(0, 6) + "…",
   });
 
-  return json;
+  return true;
 }
 
 function buildChatwootHeaders() {
-  // 1) API token (instalações usam api_access_token)
-  if (CHATWOOT_API_TOKEN) {
-    return {
-      "Content-Type": "application/json",
-      api_access_token: CHATWOOT_API_TOKEN,
-      Authorization: `Bearer ${CHATWOOT_API_TOKEN}`,
-    };
-  }
-
-  // 2) Header tokens do devise_token_auth
-  if (CW_ACCESS_TOKEN && CW_CLIENT && CW_UID) {
-    return {
-      "Content-Type": "application/json",
-      "access-token": CW_ACCESS_TOKEN,
-      client: CW_CLIENT,
-      uid: CW_UID,
-      "token-type": CW_TOKEN_TYPE || "Bearer",
-    };
-  }
-
-  return { "Content-Type": "application/json" };
+  return {
+    "Content-Type": "application/json",
+    "access-token": CW_ACCESS_TOKEN,
+    client: CW_CLIENT,
+    uid: CW_UID || "", // no seu caso existe
+    "token-type": CW_TOKEN_TYPE || "Bearer",
+  };
 }
 
 async function chatwootFetch(path, { method = "GET", body } = {}) {
   const url = `${CHATWOOT_URL}${path}`;
 
-  const res = await fetch(url, {
-    method,
-    headers: buildChatwootHeaders(),
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const doRequest = async () => {
+    const res = await fetch(url, {
+      method,
+      headers: buildChatwootHeaders(),
+      body: body ? JSON.stringify(body) : undefined,
+    });
 
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {}
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      // pode vir html/text
+    }
+
+    return { res, text, json };
+  };
+
+  let { res, text, json } = await doRequest();
+
+  // Se token expirou/401, tenta renovar e repetir 1 vez
+  if (res.status === 401) {
+    console.log("⚠️ 401 no Chatwoot. Tentando renovar tokens...");
+    await chatwootSignIn();
+    ({ res, text, json } = await doRequest());
+  }
 
   if (!res.ok) {
     throw {
@@ -154,22 +158,8 @@ async function chatwootFetch(path, { method = "GET", body } = {}) {
   return json || { ok: true };
 }
 
-// Se der 401, tenta login e repete 1x
-async function chatwootFetchWithRetry(path, opts = {}) {
-  try {
-    return await chatwootFetch(path, opts);
-  } catch (e) {
-    if (e?.status === 401 && !CHATWOOT_API_TOKEN) {
-      console.log("🔁 401 no Chatwoot. Tentando relogar e repetir…");
-      await chatwootSignIn();
-      return await chatwootFetch(path, opts);
-    }
-    throw e;
-  }
-}
-
 async function sendMessageToConversation(conversationId, content) {
-  return chatwootFetchWithRetry(
+  return chatwootFetch(
     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
     {
       method: "POST",
@@ -178,34 +168,45 @@ async function sendMessageToConversation(conversationId, content) {
   );
 }
 
-// ---------- OpenAI ----------
-async function openaiReply({ userText, conversationId, contactName, phone }) {
-  const system =
-    "Você é a ISA, atendente virtual da i9NET (provedor de internet). " +
-    "Responda em PT-BR, de forma objetiva e educada. " +
-    "Quando a mensagem do cliente for vaga, faça 1 pergunta para destravar. " +
-    "Se o cliente falar de: sem internet, lentidão, queda, boleto, mudança de endereço, planos, visita técnica, " +
-    "oriente e peça dados mínimos (nome/CPF ou número do contrato), sem expor informações sensíveis. " +
-    "Se parecer urgência (sem internet), priorize passos rápidos e confirmação de luzes do roteador/ONU.";
+// ----------------------- OpenAI -----------------------
+async function openaiReply({ customerText, context }) {
+  // Instruções simples: classifica intenção e responde curto, útil, PT-BR.
+  const system = `
+Você é a atendente virtual da i9NET (provedor de internet).
+Objetivo: entender mensagens livres (fora do menu) e ajudar rápido.
 
-  const prompt =
-    `Cliente: ${contactName || "N/D"} ${phone ? `(${phone})` : ""}\n` +
-    `Conversa ID: ${conversationId}\n` +
-    `Mensagem do cliente: ${userText}\n\n` +
-    "Gere a resposta para enviar no WhatsApp via Chatwoot. " +
-    "Não use markdown; use texto simples; pode usar emojis moderadamente.";
+Regras:
+- Responda em PT-BR, curto e objetivo.
+- Se o cliente pedir BOLETO / 2ª via / fatura: peça CPF/CNPJ ou número do contrato e o melhor canal (WhatsApp).
+- Se reclamar de internet lenta/sem sinal: faça 3 passos básicos (desligar ONU/roteador 2 min, ligar, testar cabo/wifi) e peça endereço/telefone.
+- Se pedir "falar com atendente": confirme e diga que vai encaminhar.
+- Se for algo fora do escopo: faça 1 pergunta de triagem.
+
+Contexto técnico:
+- O atendimento acontece via Chatwoot/WhatsApp.
+- Evite mandar menu numérico; interprete a intenção.
+`.trim();
+
+  const input = [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content: `Mensagem do cliente: "${customerText}"
+Contexto: ${context}`,
+    },
+  ];
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
-      instructions: system,
-      input: prompt,
-      max_output_tokens: 250,
+      input,
+      // mantém respostas curtas
+      max_output_tokens: 220,
     }),
   });
 
@@ -220,38 +221,27 @@ async function openaiReply({ userText, conversationId, contactName, phone }) {
       ok: false,
       status: res.status,
       body: json || text,
-      message: `OpenAI ${res.status}`,
+      message: "OpenAI API error",
     };
   }
 
-  // Responses API retorna o texto em output_text (helper) OU em output[].content[].text dependendo do SDK.
-  // Aqui vamos extrair de forma robusta:
-  const outputText =
+  // Respostas API: pegar o texto final de forma tolerante
+  const out =
     json?.output_text ||
-    json?.output?.flatMap((o) => o?.content || [])
-      ?.map((c) => c?.text)
-      ?.filter(Boolean)
-      ?.join("\n")
-      ?.trim() ||
-    "";
+    json?.output?.[0]?.content?.[0]?.text ||
+    json?.choices?.[0]?.message?.content ||
+    null;
 
-  return outputText || "Certo! Pode me dizer seu CPF ou número do contrato para eu localizar seu cadastro?";
+  return (out || "Certo! Pode me explicar um pouco melhor o que você precisa?").trim();
 }
 
-// ---------- Rotas ----------
+// ----------------------- Rotas -----------------------
 app.get("/", (req, res) => res.send("Bot online 🚀"));
 
 app.get("/test-chatwoot", async (req, res) => {
   try {
-    if (!assertEnvBasics()) return res.status(500).json({ ok: false, error: "Missing ENV" });
-    if (!hasChatwootAuth()) return res.status(500).json({ ok: false, error: "Missing Chatwoot auth ENV" });
-
-    // garante login se necessário
-    if (!CHATWOOT_API_TOKEN && !(CW_ACCESS_TOKEN && CW_CLIENT && CW_UID) && (CW_UID && CW_PASSWORD)) {
-      await chatwootSignIn();
-    }
-
-    const profile = await chatwootFetchWithRetry("/api/v1/profile");
+    if (!assertEnv()) return res.status(500).json({ ok: false, error: "Missing ENV" });
+    const profile = await chatwootFetch("/api/v1/profile");
     res.json({ ok: true, profile });
   } catch (e) {
     res.status(500).json(e);
@@ -263,60 +253,40 @@ app.post("/chatwoot-webhook", async (req, res) => {
   res.status(200).send("ok");
 
   try {
-    if (!assertEnvBasics()) return;
-    if (!hasChatwootAuth()) {
-      console.error("❌ Sem credenciais de autenticação do Chatwoot (API token OU login tokens OU email/senha).");
-      return;
-    }
+    if (!assertEnv()) return;
 
     const event = req.body?.event;
     if (event !== "message_created") return;
 
-    // Normaliza message_type (varia por canal). No seu payload: "incoming"/"outgoing" (string).
-    const messageType = req.body?.message_type;
+    // O seu payload já vem bem completo:
+    const messageType = req.body?.message_type; // pode vir "incoming"/"outgoing" ou 0/1
+    const isIncoming =
+      messageType === "incoming" || messageType === 0 || messageType === "0";
 
-    // Evita loop: ignora outgoing (mensagem do agente/bot)
-    if (messageType === "outgoing" || messageType === 1) {
-      console.log("🔁 Ignorando outgoing para evitar loop.");
+    // Evita loop: não responder outgoing (mensagens do próprio bot/agente)
+    if (!isIncoming) {
+      console.log("Ignorando (não entrante). message_type:", messageType);
       return;
     }
-
-    // Ignora mensagens privadas
-    if (req.body?.private) return;
 
     const conversationId = req.body?.conversation?.id;
-    if (!conversationId) return;
+    const customerText = (req.body?.content || "").trim();
 
-    const userText = (req.body?.content || "").trim();
-    if (!userText) return;
+    if (!conversationId || !customerText) return;
+    if (req.body?.private) return;
 
-    // (opcional) se quiser ignorar “mensagens automáticas” do próprio Chatwoot:
-    const senderType = req.body?.sender?.type || req.body?.sender_type; // pode variar
-    if (senderType && String(senderType).toLowerCase() === "user") {
-      console.log("🔁 Ignorando sender_type user.");
-      return;
-    }
-
-    // Garantir tokens por login se necessário
-    if (!CHATWOOT_API_TOKEN && !(CW_ACCESS_TOKEN && CW_CLIENT && CW_UID) && (CW_UID && CW_PASSWORD)) {
-      await chatwootSignIn();
-    }
-
-    const contactName = req.body?.sender?.name || req.body?.sender?.additional_attributes?.name || "";
-    const phone =
-      req.body?.sender?.phone_number ||
-      req.body?.sender?.additional_attributes?.whatsapp ||
-      req.body?.sender?.additional_attributes?.numero_de_telefone ||
-      "";
-
-    const reply = await openaiReply({ userText, conversationId, contactName, phone });
-
-    const sent = await sendMessageToConversation(conversationId, reply);
-
-    console.log("✅ Resposta enviada", {
+    console.log("📩 Webhook:", new Date().toISOString(), {
       conversationId,
-      sentId: sent?.id,
+      customerText,
     });
+
+    const context = `can_reply=${req.body?.conversation?.can_reply}; inbox=${req.body?.inbox?.name || ""}`;
+
+    const reply = await openaiReply({ customerText, context });
+
+    await sendMessageToConversation(conversationId, reply);
+
+    console.log("✅ Resposta enviada", { conversationId });
   } catch (e) {
     console.error("❌ Erro no webhook:", e);
   }
