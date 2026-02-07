@@ -378,7 +378,7 @@ Regras:
 - Seja direto.
 - Não refaça perguntas já respondidas.
 - Se identificar CPF/CNPJ ou telefone, use essa informação na resposta.
-- Se intent=COMPROVANTE: peça CPF/CNPJ (se ainda não foi informado) e depois peça mês de referência.
+- Se intent=COMPROVANTE: peça CPF/CNPJ (se ainda não foi informado).
 - Se intent=BOLETO: peça CPF/CNPJ (se ainda não foi informado).
 `.trim();
 
@@ -414,7 +414,7 @@ Regras:
 async function openaiAnalyzeAttachment({ noteText, imageDataUrl }) {
   const system = `
 Você é atendente da i9NET. Analise o comprovante enviado.
-Extraia se possível: mês de referência, valor, e tipo de pagamento (pix ou código de barras).
+Extraia se possível: valor e tipo de pagamento (pix ou código de barras).
 Responda em 1-2 frases e, se faltar algo, faça 1 pergunta objetiva.
 `.trim();
 
@@ -450,7 +450,7 @@ Responda em 1-2 frases e, se faltar algo, faça 1 pergunta objetiva.
     json?.choices?.[0]?.message?.content ||
     null;
 
-  return (out || "Recebi o comprovante. Qual o mês de referência e o valor pago?").trim();
+  return (out || "Recebi o comprovante. Qual o valor pago?").trim();
 }
 
 // ----------------------- Simple intent parse (sem GPT) -----------------------
@@ -680,27 +680,21 @@ app.post("/chatwoot-webhook", async (req, res) => {
         return;
       }
 
-      await setConversationCustomAttributes(conversationId, { gpt_state: "awaiting_month" });
+      await setConversationCustomAttributes(conversationId, { gpt_state: "awaiting_next_step" });
 
-      // ✅ aqui a conversa NÃO volta para triagem
-      await sendMessageToConversation(conversationId, "Show! Qual o *mês de referência* do boleto/fatura? (ex: 01/2026)");
+      await sendMessageToConversation(
+        conversationId,
+        "Show! Você quer *regularizar* (boleto/2ª via) ou apenas *validar o comprovante*?"
+      );
       return;
     }
 
     // Estado: esperando mês
     if (state === "awaiting_month") {
-      // aceitamos qualquer texto curto como mês
-      const m = normalizeText(customerText);
-      if (m.length < 3) {
-        await sendMessageToConversation(conversationId, "Me diga o mês de referência (ex: 01/2026).");
-        return;
-      }
-
-      await setConversationCustomAttributes(conversationId, { ref_month: m, gpt_state: "awaiting_next_step" });
-
+      await setConversationCustomAttributes(conversationId, { gpt_state: "awaiting_next_step" });
       await sendMessageToConversation(
         conversationId,
-        `Beleza! Vou conferir o pagamento e a fatura de referência *${m}*. Se você quiser, me diga agora: você quer *regularizar* (boleto/2ª via) ou apenas *validar o comprovante*?`
+        "Certo! Você quer *regularizar* (boleto/2ª via) ou apenas *validar o comprovante*?"
       );
       return;
     }
