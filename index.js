@@ -33,7 +33,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 const RECEITANET_TOKEN = process.env.RECEITANET_CHATBOT_TOKEN || "";
 const RECEITANET_BASE_URL =
-  (process.env.RECEITANET_BASE_URL || "https://sistema.receitanet.local/api/novo/chatbot/clientes").replace(/\/+$/, "");
+  (process.env.RECEITANET_BASE_URL || "https://sistema.receitanet.net/api/novo/chatbot").replace(/\/+$/, "");
 
 const GPT_LABEL_ON = process.env.GPT_LABEL_ON || "gpt_on";
 
@@ -579,4 +579,5 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
 const port = process.env.PORT || 10000;
 app.listen(port, () => console.log("🚀 Bot online na porta", port));
+
 
