@@ -3,29 +3,6 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/**
- * ENV (Render)
- * CHATWOOT_URL=https://chat.smsnet.com.br
- * CHATWOOT_ACCOUNT_ID=195
- *
- * Auth por sessão:
- * CW_UID=...
- * CW_PASSWORD=...
- *
- * (Opcional) Tokens fixos:
- * CW_ACCESS_TOKEN=...
- * CW_CLIENT=...
- * CW_TOKEN_TYPE=Bearer
- *
- * OpenAI:
- * OPENAI_API_KEY=...
- * OPENAI_MODEL=gpt-4o-mini (ou o que você usa)
- *
- * Controle:
- * AUTO_ENABLE_GPT=true
- * AUTO_ENABLE_MIN_CHARS=3
- */
-
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 
@@ -39,10 +16,14 @@ let CW_TOKEN_TYPE = process.env.CW_TOKEN_TYPE || "Bearer";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
+// ✅ Regras solicitadas
 const AUTO_ENABLE_GPT = (process.env.AUTO_ENABLE_GPT || "true").toLowerCase() === "true";
-const AUTO_ENABLE_MIN_CHARS = Number(process.env.AUTO_ENABLE_MIN_CHARS || 3);
+const AUTO_ENABLE_MIN_CHARS = Number(process.env.AUTO_ENABLE_MIN_CHARS || 4); // evita "oi"
+const AUTO_ENABLE_TRIES = Number(process.env.AUTO_ENABLE_TRIES || 3); // ✅ 3 tentativas fora do menu
+const AUTO_ENABLE_NOTICE_TEXT =
+  process.env.AUTO_ENABLE_NOTICE_TEXT || "Entendi. Vou te atender por aqui sem precisar do menu.";
 
-// fallback local se o SMSNET bloquear custom_attributes
+// fallback local se custom_attributes não persistir no SMSNET
 const localGptMode = new Map(); // conversationId -> boolean
 
 function assertEnv() {
@@ -167,38 +148,54 @@ async function setGptMode(conversationId, enabled) {
   try {
     await chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`, {
       method: "PATCH",
-      body: { custom_attributes: { gpt_mode: !!enabled } },
+      body: {
+        custom_attributes: {
+          gpt_mode: !!enabled,
+          // ✅ contador de fuga e se já mostramos o aviso
+          gpt_escape_count: enabled ? 0 : undefined,
+        },
+      },
     });
 
-    // confirma lendo de novo
-    const convo = await getConversation(conversationId);
-    const saved = convo?.custom_attributes?.gpt_mode === true;
-
-    // Atualiza fallback local também
     localGptMode.set(conversationId, !!enabled);
-
-    console.log("🧩 gpt_mode set:", { conversationId, enabled, saved });
-    return saved;
-  } catch (e) {
-    // fallback local
+    return true;
+  } catch {
     localGptMode.set(conversationId, !!enabled);
-    console.log("⚠️ Falhou setar custom_attributes, usando fallback local:", { conversationId, enabled });
     return true;
   }
 }
 
-async function getGptMode(conversationId) {
+async function getGptFlags(conversationId) {
+  // retorna { gpt_mode, gpt_escape_count, gpt_notice_sent }
   try {
     const convo = await getConversation(conversationId);
-    const enabled = convo?.custom_attributes?.gpt_mode === true;
-
-    // sincroniza fallback local
-    localGptMode.set(conversationId, enabled);
-
-    return enabled;
+    const ca = convo?.custom_attributes || {};
+    const flags = {
+      gpt_mode: ca.gpt_mode === true,
+      gpt_escape_count: Number(ca.gpt_escape_count || 0),
+      gpt_notice_sent: ca.gpt_notice_sent === true,
+    };
+    localGptMode.set(conversationId, flags.gpt_mode);
+    return flags;
   } catch {
-    // fallback local
-    return localGptMode.get(conversationId) === true;
+    return {
+      gpt_mode: localGptMode.get(conversationId) === true,
+      gpt_escape_count: 0,
+      gpt_notice_sent: false,
+    };
+  }
+}
+
+async function setCustomAttributes(conversationId, attrs) {
+  // merge de atributos
+  try {
+    await chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`, {
+      method: "PATCH",
+      body: { custom_attributes: attrs },
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -229,15 +226,12 @@ function extractResponsesText(json) {
 async function openaiReply({ customerText, context }) {
   const system = `
 Você é a atendente virtual da i9NET (provedor de internet).
-Objetivo: entender mensagens livres (fora do menu) e ajudar rápido.
-
 Regras:
-- Responda em PT-BR, curto e objetivo.
-- BOLETO/2ª via/fatura: peça CPF/CNPJ ou número do contrato + nome do titular.
-- INTERNET lenta/sem sinal: peça reinício ONU/roteador (desligar 2 min), verifique luzes (PON/LOS) e se testou via cabo.
+- PT-BR, curto e objetivo.
+- BOLETO/2ª via: peça CPF/CNPJ ou nº do contrato + nome do titular.
+- INTERNET lenta/sem sinal: reiniciar ONU/roteador 2 min, verificar luzes (PON/LOS), testar via cabo.
 - "falar com atendente": confirme e diga que vai encaminhar.
-- Se a mensagem for curta ("?"): pergunte se é boleto, suporte ou atendente.
-- Evite mandar menu numérico.
+- Não use menu numérico.
 `.trim();
 
   const input = [
@@ -267,7 +261,6 @@ Regras:
 
 // ----------------------- Helpers -----------------------
 function isIncoming(messageType) {
-  // seu payload pode vir como string ou número (e no SMSNET pode vir PT-BR)
   return (
     messageType === "incoming" ||
     messageType === "recebida" ||
@@ -282,17 +275,24 @@ function isMenuNumeric(text) {
 
 function normalizeCommand(text) {
   const t = text.trim().toLowerCase();
-  // aceita variações comuns
   if (t === "#gpt on" || t === "#gpt ligar" || t === "#gpt ligado" || t === "#gpt ativar") return "#gpt on";
   if (t === "#gpt off" || t === "#gpt desligar" || t === "#gpt desativar") return "#gpt off";
   return "";
+}
+
+function isEligibleForAutoEnable(text) {
+  const t = text.trim();
+  if (t.length < AUTO_ENABLE_MIN_CHARS) return false;     // evita "oi", "?"
+  if (isMenuNumeric(t)) return false;                     // não é fuga
+  // opcional: ignorar mensagens muito curtas tipo "ok"
+  if (t.toLowerCase() === "ok" || t.toLowerCase() === "sim" || t.toLowerCase() === "não") return false;
+  return true;
 }
 
 // ----------------------- Rotas -----------------------
 app.get("/", (_req, res) => res.send("Bot online 🚀"));
 
 app.post("/chatwoot-webhook", async (req, res) => {
-  // ACK rápido
   res.status(200).send("ok");
 
   try {
@@ -303,7 +303,6 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
     const messageType = req.body?.message_type;
     if (!isIncoming(messageType)) return;
-
     if (req.body?.private) return;
 
     const conversationId = req.body?.conversation?.id;
@@ -315,12 +314,20 @@ app.post("/chatwoot-webhook", async (req, res) => {
     // 1) comandos GPT
     const cmd = normalizeCommand(customerText);
     if (cmd === "#gpt on") {
-      await setGptMode(conversationId, true);
+      await setCustomAttributes(conversationId, {
+        gpt_mode: true,
+        gpt_escape_count: 0,
+        gpt_notice_sent: true, // se ativou manualmente, não precisa avisar
+      });
       await sendMessageToConversation(conversationId, "✅ GPT ativado nesta conversa.");
       return;
     }
     if (cmd === "#gpt off") {
-      await setGptMode(conversationId, false);
+      await setCustomAttributes(conversationId, {
+        gpt_mode: false,
+        gpt_escape_count: 0,
+        gpt_notice_sent: false,
+      });
       await sendMessageToConversation(conversationId, "🛑 GPT desativado nesta conversa.");
       return;
     }
@@ -331,22 +338,46 @@ app.post("/chatwoot-webhook", async (req, res) => {
       return;
     }
 
-    // 3) Autoativar em texto livre
-    let gptOn = await getGptMode(conversationId);
-    if (!gptOn && AUTO_ENABLE_GPT && customerText.length >= AUTO_ENABLE_MIN_CHARS) {
-      await setGptMode(conversationId, true);
-      gptOn = true;
-      // opcional: confirme
-      await sendMessageToConversation(conversationId, "✅ Entendi. Vou te atender por aqui sem precisar do menu.");
+    // 3) lê estado atual
+    const flags = await getGptFlags(conversationId);
+
+    // 4) Autoativação somente após 3 fugas
+    let gptOn = flags.gpt_mode;
+
+    if (!gptOn && AUTO_ENABLE_GPT && isEligibleForAutoEnable(customerText)) {
+      const nextCount = (flags.gpt_escape_count || 0) + 1;
+
+      // grava o contador
+      await setCustomAttributes(conversationId, { gpt_escape_count: nextCount });
+
+      console.log("🟡 fuga do menu:", { conversationId, nextCount });
+
+      if (nextCount >= AUTO_ENABLE_TRIES) {
+        // ativa
+        await setCustomAttributes(conversationId, {
+          gpt_mode: true,
+          gpt_escape_count: 0,
+        });
+        gptOn = true;
+
+        // ✅ aviso só 1 vez por conversa
+        if (!flags.gpt_notice_sent && AUTO_ENABLE_NOTICE_TEXT) {
+          await sendMessageToConversation(conversationId, AUTO_ENABLE_NOTICE_TEXT);
+          await setCustomAttributes(conversationId, { gpt_notice_sent: true });
+        }
+      } else {
+        // ainda não chegou em 3 fugas -> deixa SMSNET atuar
+        return;
+      }
     }
 
-    // 4) Se GPT ainda OFF, não responde (mantém SMSNET)
+    // 5) Se GPT ainda OFF, não responde
     if (!gptOn) {
       console.log("🚫 GPT OFF (gpt_mode=false). Ignorando.");
       return;
     }
 
-    // 5) GPT ON -> responde
+    // 6) GPT ON -> responde
     const context = `can_reply=${req.body?.conversation?.can_reply}; inbox=${req.body?.inbox?.name || ""}`;
     const reply = await openaiReply({ customerText, context });
 
