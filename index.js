@@ -4,28 +4,18 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 /**
- * =========================
  * ENV (Render)
- * =========================
  * CHATWOOT_URL=https://chat.smsnet.com.br
  * CHATWOOT_ACCOUNT_ID=195
- * CW_UID=seuemail
- * CW_PASSWORD=suasenha
- * (opcional) CW_ACCESS_TOKEN=...
- * (opcional) CW_CLIENT=...
- * (opcional) CW_TOKEN_TYPE=Bearer
- *
+ * CW_UID=...
+ * CW_PASSWORD=...
  * OPENAI_API_KEY=sk-...
  * OPENAI_MODEL=gpt-5.2 (ou gpt-5-mini)
  *
  * RECEITANET_CHATBOT_TOKEN=69750e44-9fae-426b-a569-1e40403cec68
  * RECEITANET_BASE_URL=https://sistema.receitanet.net/api/novo/chatbot
  *
- * =========================
- * Labels (Chatwoot)
- * =========================
  * GPT_LABEL_ON=gpt_on
- * GPT_LABEL_MODE=gpt_mode   (opcional, se quiser separar)
  */
 
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
@@ -48,8 +38,7 @@ const RECEITANET_BASE_URL =
 const GPT_LABEL_ON = process.env.GPT_LABEL_ON || "gpt_on";
 
 // =========================
-// Memória em runtime (rápida)
-// (persistência real: label no Chatwoot)
+// Estado em memória por conversa
 // =========================
 const conversationState = new Map();
 /**
@@ -58,8 +47,15 @@ const conversationState = new Map();
  *   gptOn: boolean,
  *   greeted: boolean,
  *   lastHandledMessageId: string|number|null,
+ *
+ *   phoneChecked: boolean,       // ✅ evita lookup repetido (loop)
+ *   phoneNotFound: boolean,
+ *
+ *   awaiting: "none"|"is_client"|"cpfcnpj",   // ✅ controla perguntas
+ *   askedIsClient: boolean,
+ *   askedCpf: boolean,
+ *
  *   client: { idCliente, razaoSocial, cpfCnpj } | null,
- *   flow: "unknown"|"client"|"sales"
  * }
  */
 
@@ -70,8 +66,15 @@ function getState(conversationId) {
       gptOn: false,
       greeted: false,
       lastHandledMessageId: null,
+
+      phoneChecked: false,
+      phoneNotFound: false,
+
+      awaiting: "none",
+      askedIsClient: false,
+      askedCpf: false,
+
       client: null,
-      flow: "unknown",
     });
   }
   return conversationState.get(conversationId);
@@ -97,13 +100,9 @@ function assertEnv() {
 }
 
 // =========================
-// Chatwoot Auth
+// Chatwoot auth + fetch
 // =========================
 async function chatwootSignIn() {
-  if (!CW_UID || !CW_PASSWORD) {
-    throw new Error("Sem CW_UID/CW_PASSWORD para renovar tokens.");
-  }
-
   const url = `${CHATWOOT_URL}/auth/sign_in`;
   const res = await fetch(url, {
     method: "POST",
@@ -116,34 +115,18 @@ async function chatwootSignIn() {
   try { json = text ? JSON.parse(text) : null; } catch {}
 
   if (!res.ok) {
-    throw {
-      ok: false,
-      status: res.status,
-      url,
-      body: json || text,
-      message: "Falha no /auth/sign_in",
-    };
+    throw { status: res.status, url, body: json || text };
   }
 
   const accessToken = res.headers.get("access-token") || "";
   const client = res.headers.get("client") || "";
   const tokenType = res.headers.get("token-type") || "Bearer";
 
-  if (!accessToken || !client) {
-    throw new Error("Sign-in OK, mas não retornou access-token/client.");
-  }
+  if (!accessToken || !client) throw new Error("Sign-in ok, mas sem access-token/client.");
 
   CW_ACCESS_TOKEN = accessToken;
   CW_CLIENT = client;
   CW_TOKEN_TYPE = tokenType;
-
-  console.log("🔄 Tokens renovados via sign_in:", {
-    uid: CW_UID,
-    client: CW_CLIENT.slice(0, 6) + "…",
-    access: CW_ACCESS_TOKEN.slice(0, 6) + "…",
-  });
-
-  return true;
 }
 
 function buildChatwootHeaders() {
@@ -175,65 +158,42 @@ async function chatwootFetch(path, { method = "GET", body } = {}) {
   let { res, text, json } = await doRequest();
 
   if (res.status === 401) {
-    console.log("⚠️ 401 no Chatwoot. Tentando renovar tokens...");
     await chatwootSignIn();
     ({ res, text, json } = await doRequest());
   }
 
-  if (!res.ok) {
-    throw {
-      ok: false,
-      status: res.status,
-      url,
-      body: json || text,
-      message: `Chatwoot API ${res.status}`,
-    };
-  }
-
+  if (!res.ok) throw { status: res.status, url, body: json || text };
   return json || { ok: true };
 }
 
 async function sendMessageToConversation(conversationId, content) {
+  console.log("✅ enviado", { conversaId: conversationId, preview: String(content).slice(0, 90) });
   return chatwootFetch(
     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
-    {
-      method: "POST",
-      body: { content, message_type: "outgoing" },
-    }
+    { method: "POST", body: { content, message_type: "outgoing" } }
   );
 }
 
-// Labels: buscar e atualizar (persistência)
 async function getConversation(conversationId) {
-  return chatwootFetch(
-    `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`
-  );
+  return chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`);
 }
 
 async function updateConversationLabels(conversationId, labels) {
-  // Endpoint padrão do Chatwoot para labels:
-  // POST /api/v1/accounts/:account_id/conversations/:conversation_id/labels
-  // body: { labels: ["a","b"] }
   return chatwootFetch(
     `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/labels`,
-    {
-      method: "POST",
-      body: { labels },
-    }
+    { method: "POST", body: { labels } }
   );
 }
 
 // =========================
-// ReceitaNet Client (ChatBot API)
+// ReceitaNet
 // =========================
 function rnUrl(path, params = {}) {
   const u = new URL(`${RECEITANET_BASE_URL}${path}`);
   u.searchParams.set("token", RECEITANET_TOKEN);
   u.searchParams.set("app", "chatbot");
   for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && String(v).length > 0) {
-      u.searchParams.set(k, String(v));
-    }
+    if (v !== undefined && v !== null && String(v).length > 0) u.searchParams.set(k, String(v));
   }
   return u.toString();
 }
@@ -245,26 +205,17 @@ async function receitanetPost(path, params = {}) {
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch {}
 
-  if (!res.ok) {
-    const err = { status: res.status, url, body: json || text };
-    throw err;
-  }
+  if (!res.ok) throw { status: res.status, url, body: json || text };
   return json;
 }
 
 function normalizePhone(phoneRaw) {
   if (!phoneRaw) return "";
-  // mantém só dígitos
   let p = String(phoneRaw).replace(/\D+/g, "");
-  // remove 55 se vier duplicado
-  if (p.startsWith("55") && p.length > 11) {
-    p = p.slice(2);
-  }
-  // retorna com DDD+numero (11 dígitos BR geralmente)
+  if (p.startsWith("55") && p.length > 11) p = p.slice(2);
   return p;
 }
 
-// Tenta extrair telefone do payload do Chatwoot (varia por canal)
 function extractWhatsappPhone(payload) {
   const candidates = [
     payload?.sender?.phone_number,
@@ -281,18 +232,14 @@ function extractWhatsappPhone(payload) {
 }
 
 async function rnLookupClientByPhone(phone) {
-  // POST /clientes?phone=...
   return receitanetPost("/clientes", { phone });
 }
 
 async function rnLookupClientByCpfCnpj(cpfcnpj) {
-  // POST /clientes?cpfcnpj=...
   return receitanetPost("/clientes", { cpfcnpj });
 }
 
 async function rnDebitosByCpfCnpj(cpfcnpj) {
-  // POST /debitos?cpfcnpj=...&status=0
-  // status: 0,1,2 (conforme doc)
   return receitanetPost("/debitos", { cpfcnpj, status: 0, page: 1 });
 }
 
@@ -302,49 +249,29 @@ async function rnDebitosByCpfCnpj(cpfcnpj) {
 async function openaiReply({ customerText, context }) {
   const system = `
 Você é a atendente virtual da i9NET (provedor de internet).
-Objetivo: entender mensagens livres e resolver rápido.
-
 Regras:
-- Responda em PT-BR, curto e objetivo.
-- Nunca envie menu numérico.
-- Se o cliente pedir BOLETO/2ª via/fatura: peça CPF/CNPJ se não tiver, ou envie os dados do boleto se já tiver.
-- Se internet lenta/sem sinal: faça triagem simples e peça confirmação do procedimento.
-- Se pedir humano: confirme e diga que vai encaminhar.
+- PT-BR, curto e objetivo.
+- Não envie menu numérico.
+- Se pedir boleto e não tiver CPF/CNPJ: solicite.
+- Se pedir humano: confirme encaminhamento.
 `.trim();
 
   const input = [
     { role: "system", content: system },
-    {
-      role: "user",
-      content: `Mensagem: "${customerText}"\nContexto: ${context}`,
-    },
+    { role: "user", content: `Mensagem: "${customerText}"\nContexto: ${context}` },
   ];
 
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input,
-      max_output_tokens: 220,
-    }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify({ model: OPENAI_MODEL, input, max_output_tokens: 220 }),
   });
 
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch {}
 
-  if (!res.ok) {
-    throw {
-      ok: false,
-      status: res.status,
-      body: json || text,
-      message: "OpenAI API error",
-    };
-  }
+  if (!res.ok) throw { status: res.status, body: json || text };
 
   const out =
     json?.output_text ||
@@ -356,41 +283,46 @@ Regras:
 }
 
 // =========================
-// Menu / Fuga do menu (heurística)
+// Heurística menu / fuga
 // =========================
 function isMenuAnswer(text) {
   const t = (text || "").trim();
-  // respostas típicas do menu SMSNET: "1", "2", "3"
   return /^[1-3]$/.test(t);
 }
-
 function looksLikeEscape(text) {
   const t = (text || "").trim();
   if (!t) return false;
   if (isMenuAnswer(t)) return false;
-  // se tem letra, ou frase maior que 1 char, é fuga
   if (/[a-zA-ZÀ-ÿ]/.test(t)) return true;
   if (t.length > 1) return true;
   return false;
 }
 
+function isYes(text) {
+  const t = (text || "").trim().toLowerCase();
+  return ["sim", "s", "sou", "sou sim", "claro", "isso"].includes(t);
+}
+function isNo(text) {
+  const t = (text || "").trim().toLowerCase();
+  return ["nao", "não", "n", "negativo", "ainda nao", "ainda não"].includes(t);
+}
+
+function extractCpfCnpjDigits(text) {
+  const d = String(text || "").replace(/\D+/g, "");
+  if (d.length === 11 || d.length === 14) return d;
+  return "";
+}
+
+function askedBoleto(text) {
+  return /boleto|fatura|2a via|segunda via|segunda-via/i.test(text || "");
+}
+
 // =========================
-// Webhook
+// Rotas
 // =========================
 app.get("/", (req, res) => res.send("Bot online 🚀"));
 
-app.get("/test-chatwoot", async (req, res) => {
-  try {
-    if (!assertEnv()) return res.status(500).json({ ok: false, error: "Missing ENV" });
-    const profile = await chatwootFetch("/api/v1/profile");
-    res.json({ ok: true, profile });
-  } catch (e) {
-    res.status(500).json(e);
-  }
-});
-
 app.post("/chatwoot-webhook", async (req, res) => {
-  // ACK rápido
   res.status(200).send("ok");
 
   try {
@@ -400,115 +332,91 @@ app.post("/chatwoot-webhook", async (req, res) => {
     if (event !== "message_created") return;
 
     const messageType = req.body?.message_type;
-    const isIncoming =
-      messageType === "incoming" || messageType === 0 || messageType === "0";
-
-    // anti-loop
+    const isIncoming = messageType === "incoming" || messageType === 0 || messageType === "0";
     if (!isIncoming) return;
     if (req.body?.private) return;
 
     const conversationId = req.body?.conversation?.id;
     const messageId = req.body?.id;
     const customerText = (req.body?.content || "").trim();
-
     if (!conversationId || !customerText) return;
 
-    // Dedupe simples por messageId
     const state = getState(conversationId);
-    if (state.lastHandledMessageId && String(state.lastHandledMessageId) === String(messageId)) {
-      return;
-    }
+
+    // dedupe por messageId
+    if (state.lastHandledMessageId && String(state.lastHandledMessageId) === String(messageId)) return;
     state.lastHandledMessageId = messageId;
 
     console.log("🔥 webhook: message_created | tipo: incoming");
     console.log("📩 PROCESSANDO:", { conversaId: conversationId, customerText });
 
-    // Carrega conversa do Chatwoot para ler labels atuais (persistência)
+    // Conversa/labels
     let convo = null;
+    let labels = [];
     try {
       convo = await getConversation(conversationId);
-    } catch (e) {
-      console.log("⚠️ Não consegui ler conversa no Chatwoot (seguindo mesmo assim).", e?.status || e);
-    }
+      labels = convo?.labels || convo?.conversation?.labels || [];
+    } catch {}
 
-    const labels = convo?.labels || convo?.conversation?.labels || [];
-    const hasGptLabel = Array.isArray(labels) && labels.includes(GPT_LABEL_ON);
+    if (Array.isArray(labels) && labels.includes(GPT_LABEL_ON)) state.gptOn = true;
 
-    // Se já tiver label, GPT está ON
-    if (hasGptLabel) {
-      state.gptOn = true;
-    }
-
-    // =========================
-    // 1) Se GPT ainda OFF: contar fuga do menu
-    // =========================
+    // 1) Se GPT OFF: contar fuga (3x)
     if (!state.gptOn) {
       if (looksLikeEscape(customerText)) {
-        state.escapeCount = (state.escapeCount || 0) + 1;
+        state.escapeCount += 1;
         console.log("🟡 fuga do menu:", { conversationId, nextCount: state.escapeCount });
 
         if (state.escapeCount >= 3) {
-          console.log("⚡ GPT autoativador (3 tentativas) -> ativando GPT");
+          console.log("⚡ GPT autoativador (3 testes) -> ativando GPT");
           state.gptOn = true;
 
-          // marca label no Chatwoot (persistente)
           try {
             const nextLabels = Array.from(new Set([...(labels || []), GPT_LABEL_ON]));
             await updateConversationLabels(conversationId, nextLabels);
-            console.log("🏷️ Label aplicada:", { conversationId, label: GPT_LABEL_ON });
-          } catch (e) {
-            console.log("⚠️ Falha ao aplicar label (ok, fica em memória):", e?.status || e);
-          }
+            console.log("🏷️ Rótulo aplicado:", { conversationId, label: GPT_LABEL_ON });
+          } catch {}
 
-          // IMPORTANTE: manda “assumi” apenas UMA vez por conversa
+          // mensagem de “assumi” só 1 vez
           if (!state.greeted) {
-            await sendMessageToConversation(
-              conversationId,
-              "✅ Entendi. Vou te atender por aqui sem precisar do menu."
-            );
+            await sendMessageToConversation(conversationId, "✅ Entendi. Vou te atender por aqui sem precisar do menu.");
             state.greeted = true;
           }
         } else {
-          // ainda não ativou, não responda para não brigar com SMSNET
+          // não responde antes de ativar (evita briga com SMSNET)
           return;
         }
       } else {
-        // se cliente está respondendo o menu, zera fuga
         state.escapeCount = 0;
         return;
       }
     }
 
     // =========================
-    // 2) GPT ON -> ReceitaNet: identificar cliente por telefone
+    // A partir daqui: GPT ON
     // =========================
     const phone = extractWhatsappPhone(req.body);
-    let context = `inbox=${req.body?.inbox?.name || ""}; phone=${phone || "N/A"}`;
+    const context = `phone=${phone || "N/A"}; inbox=${req.body?.inbox?.name || ""}; awaiting=${state.awaiting}`;
 
-    // Se ainda não temos cliente no state, tenta buscar no ReceitaNet pelo telefone
-    if (!state.client && phone) {
+    // 2) Lookup por telefone: FAZER SÓ UMA VEZ por conversa
+    if (!state.client && phone && !state.phoneChecked) {
+      state.phoneChecked = true;
       try {
         const rn = await rnLookupClientByPhone(phone);
-        // Resposta tipo ClienteResponse (idCliente, razaoSocial, cpfCnpj)
         if (rn?.idCliente) {
-          state.client = {
-            idCliente: rn.idCliente,
-            razaoSocial: rn.razaoSocial,
-            cpfCnpj: rn.cpfCnpj,
-          };
-          state.flow = "client";
+          state.client = { idCliente: rn.idCliente, razaoSocial: rn.razaoSocial, cpfCnpj: rn.cpfCnpj };
+          state.awaiting = "none";
+          state.askedIsClient = false;
+          state.askedCpf = false;
 
-          // Saúda só uma vez (não repetir toda mensagem)
           if (!state.greeted) {
-            await sendMessageToConversation(
-              conversationId,
-              `Olá, ${rn.razaoSocial}! 👋 Como posso ajudar hoje?`
-            );
+            await sendMessageToConversation(conversationId, `Olá, ${rn.razaoSocial}! 👋 Como posso ajudar?`);
             state.greeted = true;
+            return;
           }
         }
       } catch (e) {
         if (e?.status === 404) {
+          state.phoneNotFound = true;
           console.log("ℹ️ ReceitaNet: telefone não localizado (404).");
         } else {
           console.log("⚠️ ReceitaNet lookup phone falhou:", e?.status || e);
@@ -516,72 +424,110 @@ app.post("/chatwoot-webhook", async (req, res) => {
       }
     }
 
-    // Se não achou por telefone, decidir fluxo (cliente x vendas)
+    // 3) Se ainda não identificado (sem state.client), CONTROLAR PERGUNTAS (sem loop)
     if (!state.client) {
-      // Se cliente pediu boleto sem estar identificado -> pedir CPF/CNPJ
-      if (/boleto|fatura|2a via|segunda via|segunda-via/i.test(customerText)) {
-        await sendMessageToConversation(
-          conversationId,
-          "Para eu localizar seu boleto, me envie seu CPF/CNPJ (somente números), por favor."
-        );
+      // Se o cliente mandou o próprio telefone (ex: 7018...), isso não ajuda.
+      // Não trate como CPF/CNPJ, apenas continue o fluxo.
+      const digits = customerText.replace(/\D+/g, "");
+      const looksLikePhone = digits.length >= 10 && digits.length <= 13;
+
+      // Se estamos aguardando SIM/NÃO
+      if (state.awaiting === "is_client") {
+        if (isYes(customerText)) {
+          state.awaiting = "cpfcnpj";
+          if (!state.askedCpf) {
+            await sendMessageToConversation(conversationId, "Perfeito. Me envie seu CPF/CNPJ (somente números) para eu localizar seu cadastro.");
+            state.askedCpf = true;
+          }
+          return;
+        }
+        if (isNo(customerText)) {
+          state.awaiting = "none";
+          await sendMessageToConversation(
+            conversationId,
+            "Sem problemas 😊 Você quer contratar um plano novo? Se sim, me diga seu bairro e se prefere 2.4G/5G (Wi-Fi 6) e eu te passo as opções."
+          );
+          return;
+        }
+        // resposta inválida
+        await sendMessageToConversation(conversationId, "Me responda apenas: SIM ou NÃO 🙂");
         return;
       }
 
-      // Se mandou CPF/CNPJ, tenta identificar
-      const cpfCnpjDigits = customerText.replace(/\D+/g, "");
-      if (cpfCnpjDigits.length === 11 || cpfCnpjDigits.length === 14) {
+      // Se estamos aguardando CPF/CNPJ
+      if (state.awaiting === "cpfcnpj") {
+        const cpf = extractCpfCnpjDigits(customerText);
+        if (!cpf) {
+          await sendMessageToConversation(conversationId, "Envie CPF/CNPJ com 11 ou 14 dígitos (somente números), por favor.");
+          return;
+        }
+
         try {
-          const rn = await rnLookupClientByCpfCnpj(cpfCnpjDigits);
+          const rn = await rnLookupClientByCpfCnpj(cpf);
           if (rn?.idCliente) {
-            state.client = {
-              idCliente: rn.idCliente,
-              razaoSocial: rn.razaoSocial,
-              cpfCnpj: rn.cpfCnpj,
-            };
-            state.flow = "client";
-            await sendMessageToConversation(
-              conversationId,
-              `Perfeito, ${rn.razaoSocial}! Encontrei seu cadastro. Como posso ajudar?`
-            );
+            state.client = { idCliente: rn.idCliente, razaoSocial: rn.razaoSocial, cpfCnpj: rn.cpfCnpj };
+            state.awaiting = "none";
+            state.askedIsClient = false;
+            state.askedCpf = false;
+            await sendMessageToConversation(conversationId, `Encontrei seu cadastro, ${rn.razaoSocial}! ✅ O que você precisa?`);
             return;
           }
         } catch (e) {
           if (e?.status === 404) {
-            await sendMessageToConversation(
-              conversationId,
-              "Não encontrei esse CPF/CNPJ como cliente. Você já é cliente i9NET? (Responda: SIM ou NÃO)"
-            );
+            state.awaiting = "is_client";
+            if (!state.askedIsClient) {
+              await sendMessageToConversation(conversationId, "Não encontrei esse CPF/CNPJ. Você já é cliente i9NET? (SIM ou NÃO)");
+              state.askedIsClient = true;
+            }
             return;
           }
-          console.log("⚠️ ReceitaNet lookup cpfcnpj falhou:", e?.status || e);
+          await sendMessageToConversation(conversationId, "Tive uma falha ao consultar agora. Pode tentar novamente em 1 minuto?");
+          return;
         }
       }
 
-      // Pergunta padrão quando não identificado
-      await sendMessageToConversation(
-        conversationId,
-        "Você já é cliente i9NET? (Responda: SIM ou NÃO)"
-      );
+      // Fluxo inicial quando não identificado:
+      // Se pediu boleto -> pedir CPF/CNPJ e setar awaiting
+      if (askedBoleto(customerText)) {
+        state.awaiting = "cpfcnpj";
+        if (!state.askedCpf) {
+          await sendMessageToConversation(conversationId, "Para eu localizar seu boleto, me envie seu CPF/CNPJ (somente números), por favor.");
+          state.askedCpf = true;
+        }
+        return;
+      }
+
+      // Se mandou um número que parece telefone, não ficar insistindo no lookup do telefone.
+      // Pergunta se é cliente.
+      if (looksLikePhone) {
+        state.awaiting = "is_client";
+        if (!state.askedIsClient) {
+          await sendMessageToConversation(conversationId, "Você já é cliente i9NET? (SIM ou NÃO)");
+          state.askedIsClient = true;
+        }
+        return;
+      }
+
+      // Pergunta padrão única (sem repetir)
+      state.awaiting = "is_client";
+      if (!state.askedIsClient) {
+        await sendMessageToConversation(conversationId, "Você já é cliente i9NET? (SIM ou NÃO)");
+        state.askedIsClient = true;
+      }
       return;
     }
 
-    // =========================
-    // 3) Cliente identificado -> ações ReceitaNet (boleto etc.)
-    // =========================
-    if (/boleto|fatura|2a via|segunda via/i.test(customerText)) {
-      const cpf = state.client.cpfCnpj;
+    // 4) Cliente identificado -> boleto via ReceitaNet
+    if (askedBoleto(customerText)) {
       try {
+        const cpf = state.client.cpfCnpj;
         const debitos = await rnDebitosByCpfCnpj(cpf);
 
-        // A doc mostra lista com boletos {vencimento, valor, link, qrcode_pix, barras}
         const first = Array.isArray(debitos) ? debitos[0] : null;
         const boleto = first?.boletos;
 
         if (!boleto) {
-          await sendMessageToConversation(
-            conversationId,
-            "Não encontrei boletos em aberto no momento. Se quiser, me diga qual mês/competência você precisa."
-          );
+          await sendMessageToConversation(conversationId, "Não encontrei boletos em aberto no momento. Qual mês/competência você precisa?");
           return;
         }
 
@@ -596,22 +542,17 @@ app.post("/chatwoot-webhook", async (req, res) => {
         await sendMessageToConversation(conversationId, msg);
         return;
       } catch (e) {
-        console.log("⚠️ Erro ao buscar débitos:", e?.status || e);
-        await sendMessageToConversation(
-          conversationId,
-          "Tive uma falha ao consultar seu boleto agora. Pode tentar novamente em 1 minuto?"
-        );
+        console.log("⚠️ erro debitos:", e?.status || e);
+        await sendMessageToConversation(conversationId, "Tive uma falha ao consultar seu boleto agora. Pode tentar novamente em 1 minuto?");
         return;
       }
     }
 
-    // =========================
-    // 4) Se não caiu em ação -> responde com GPT (continua conversa)
-    // =========================
+    // 5) Qualquer outra coisa -> GPT
     const reply = await openaiReply({ customerText, context });
     await sendMessageToConversation(conversationId, reply);
   } catch (e) {
-    console.error("❌ Erro no webhook:", e);
+    console.error("❌ erro webhook:", e?.status || e);
   }
 });
 
