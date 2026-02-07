@@ -4,332 +4,162 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-/**
- * ENV
- * CHATWOOT_URL=https://chat.smsnet.com.br
- * CHATWOOT_ACCOUNT_ID=195
- * CW_UID=...
- * CW_PASSWORD=...
- * OPENAI_API_KEY=...
- * OPENAI_MODEL=gpt-4o-mini
- *
- * Controle:
- * GPT_LABEL=gpt_on
- */
-
-const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
-const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
+const CHATWOOT_URL = process.env.CHATWOOT_URL.replace(/\/+$/, "");
+const ACCOUNT = process.env.CHATWOOT_ACCOUNT_ID;
 
 const CW_UID = process.env.CW_UID;
 const CW_PASSWORD = process.env.CW_PASSWORD;
 
-let CW_ACCESS_TOKEN = process.env.CW_ACCESS_TOKEN || "";
-let CW_CLIENT = process.env.CW_CLIENT || "";
-let CW_TOKEN_TYPE = process.env.CW_TOKEN_TYPE || "Bearer";
+let TOKEN = "";
+let CLIENT = "";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-const GPT_LABEL = process.env.GPT_LABEL || "gpt_on";
+// ---------------- AUTH ----------------
 
-function assertEnv() {
-  const missing = [];
-  if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
-  if (!CHATWOOT_ACCOUNT_ID) missing.push("CHATWOOT_ACCOUNT_ID");
-  if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");
-
-  if (!CW_ACCESS_TOKEN || !CW_CLIENT) {
-    if (!CW_UID) missing.push("CW_UID (ou CW_ACCESS_TOKEN/CW_CLIENT)");
-    if (!CW_PASSWORD) missing.push("CW_PASSWORD (ou CW_ACCESS_TOKEN/CW_CLIENT)");
-  }
-
-  if (missing.length) {
-    console.error("Faltando ENV:", missing.join(" / "));
-    return false;
-  }
-  return true;
-}
-
-// ----------------------- Chatwoot auth -----------------------
-async function chatwootSignIn() {
-  if (!CW_UID || !CW_PASSWORD) {
-    throw new Error("Sem CW_UID/CW_PASSWORD para renovar tokens.");
-  }
-
-  const url = `${CHATWOOT_URL}/auth/sign_in`;
-  const res = await fetch(url, {
+async function login() {
+  const r = await fetch(`${CHATWOOT_URL}/auth/sign_in`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: CW_UID, password: CW_PASSWORD }),
+    body: JSON.stringify({ email: CW_UID, password: CW_PASSWORD })
   });
 
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch {}
-
-  if (!res.ok) {
-    throw new Error(`Falha no /auth/sign_in (${res.status}): ${JSON.stringify(json || text)}`);
-  }
-
-  const accessToken = res.headers.get("access-token") || "";
-  const client = res.headers.get("client") || "";
-  const tokenType = res.headers.get("token-type") || "Bearer";
-
-  if (!accessToken || !client) {
-    throw new Error("Sign-in OK, mas não retornou access-token/client.");
-  }
-
-  CW_ACCESS_TOKEN = accessToken;
-  CW_CLIENT = client;
-  CW_TOKEN_TYPE = tokenType;
-
-  console.log("🔄 Tokens renovados via sign_in:", {
-    uid: CW_UID,
-    client: CW_CLIENT.slice(0, 6) + "…",
-    access: CW_ACCESS_TOKEN.slice(0, 6) + "…",
-  });
-
-  return true;
+  TOKEN = r.headers.get("access-token");
+  CLIENT = r.headers.get("client");
 }
 
-function buildChatwootHeaders() {
+function headers() {
   return {
     "Content-Type": "application/json",
-    "access-token": CW_ACCESS_TOKEN,
-    client: CW_CLIENT,
-    uid: CW_UID || "",
-    "token-type": CW_TOKEN_TYPE || "Bearer",
+    "access-token": TOKEN,
+    client: CLIENT,
+    uid: CW_UID
   };
 }
 
-async function chatwootFetch(path, { method = "GET", body } = {}) {
-  const url = `${CHATWOOT_URL}${path}`;
+async function cw(path, opt = {}) {
+  let r = await fetch(`${CHATWOOT_URL}${path}`, {
+    ...opt,
+    headers: headers(),
+    body: opt.body ? JSON.stringify(opt.body) : undefined
+  });
 
-  const doRequest = async () => {
-    const res = await fetch(url, {
-      method,
-      headers: buildChatwootHeaders(),
-      body: body ? JSON.stringify(body) : undefined,
+  if (r.status === 401) {
+    await login();
+    r = await fetch(`${CHATWOOT_URL}${path}`, {
+      ...opt,
+      headers: headers(),
+      body: opt.body ? JSON.stringify(opt.body) : undefined
     });
-
-    const text = await res.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch {}
-
-    return { res, text, json };
-  };
-
-  let { res, text, json } = await doRequest();
-
-  if (res.status === 401) {
-    console.log("⚠️ 401 no Chatwoot. Tentando renovar tokens...");
-    await chatwootSignIn();
-    ({ res, text, json } = await doRequest());
   }
 
-  if (!res.ok) {
-    throw new Error(`Chatwoot API ${res.status} (${url}): ${JSON.stringify(json || text)}`);
-  }
-
-  return json || { ok: true };
+  return r.json();
 }
 
-async function sendMessageToConversation(conversationId, content) {
-  return chatwootFetch(
-    `/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
-    { method: "POST", body: { content, message_type: "outgoing" } }
-  );
-}
+// ---------------- GPT MODE ----------------
 
-async function getConversation(conversationId) {
-  return chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`, {
-    method: "GET",
+async function setGPT(conversationId, enabled) {
+  await cw(`/api/v1/accounts/${ACCOUNT}/conversations/${conversationId}`, {
+    method: "PATCH",
+    body: {
+      custom_attributes: {
+        gpt_mode: enabled
+      }
+    }
   });
 }
 
-function extractLabels(convo) {
-  // Alguns retornam labels, outros label_list
-  const a = convo?.labels;
-  if (Array.isArray(a) && a.length) return a;
-
-  const b = convo?.label_list;
-  if (Array.isArray(b) && b.length) return b;
-
-  const c = convo?.data?.labels;
-  if (Array.isArray(c) && c.length) return c;
-
-  const d = convo?.data?.label_list;
-  if (Array.isArray(d) && d.length) return d;
-
-  return Array.isArray(a) ? a : Array.isArray(b) ? b : [];
+async function getGPT(conversationId) {
+  const c = await cw(`/api/v1/accounts/${ACCOUNT}/conversations/${conversationId}`);
+  return c?.custom_attributes?.gpt_mode === true;
 }
 
-async function patchConversationLabels(conversationId, labels) {
-  // Tenta 2 formatos: labels e label_list
-  // 1) labels
-  try {
-    return await chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`, {
-      method: "PATCH",
-      body: { labels },
-    });
-  } catch (e1) {
-    console.log("⚠️ PATCH labels falhou, tentando label_list...", String(e1?.message || e1));
-    // 2) label_list
-    return await chatwootFetch(`/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`, {
-      method: "PATCH",
-      body: { label_list: labels },
-    });
-  }
-}
+// ---------------- GPT ----------------
 
-async function setGptLabel(conversationId, enabled) {
-  const convoBefore = await getConversation(conversationId);
-  const current = new Set(extractLabels(convoBefore));
-
-  if (enabled) current.add(GPT_LABEL);
-  else current.delete(GPT_LABEL);
-
-  const desired = Array.from(current);
-
-  // tenta atualizar
-  await patchConversationLabels(conversationId, desired);
-
-  // confirma lendo de novo
-  const convoAfter = await getConversation(conversationId);
-  const afterLabels = extractLabels(convoAfter);
-
-  return { desired, afterLabels };
-}
-
-// ----------------------- OpenAI -----------------------
-async function openaiReply({ customerText, context }) {
-  const system = `
-Você é a atendente virtual da i9NET (provedor de internet).
-Regras:
-- Responda em PT-BR, curto e objetivo.
-- Sem menu numérico.
-- Se pedir boleto: peça CPF/CNPJ ou número do contrato.
-- Se sem internet/lenta: peça reinício ONU/roteador 2 min + 1 pergunta de triagem.
-- Se pedir atendente: confirme e diga que vai encaminhar.
-`.trim();
-
-  const input = [
-    { role: "system", content: system },
-    { role: "user", content: `Mensagem do cliente: "${customerText}"\nContexto: ${context}` },
-  ];
-
-  const res = await fetch("https://api.openai.com/v1/responses", {
+async function gpt(text) {
+  const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_KEY}`
     },
     body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input,
-      max_output_tokens: 220,
-    }),
+      model: MODEL,
+      input: [
+        { role: "system", content: "Atendente ISP profissional. Responda curto." },
+        { role: "user", content: text }
+      ]
+    })
   });
 
-  const text = await res.text();
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch {}
-
-  if (!res.ok) {
-    throw new Error(`OpenAI API error (${res.status}): ${JSON.stringify(json || text)}`);
-  }
-
-  const out =
-    json?.output_text ||
-    json?.output?.[0]?.content?.[0]?.text ||
-    json?.choices?.[0]?.message?.content ||
-    null;
-
-  return (out || "Certo! Pode me explicar um pouco melhor o que você precisa?").trim();
+  const j = await r.json();
+  return j.output_text || "Pode explicar melhor?";
 }
 
-// ----------------------- Rotas -----------------------
-app.get("/", (_req, res) => res.send("Bot online 🚀"));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+// ---------------- MSG ----------------
 
-app.get("/test-chatwoot", async (_req, res) => {
-  try {
-    if (!assertEnv()) return res.status(500).json({ ok: false, error: "Missing ENV" });
-    const profile = await chatwootFetch("/api/v1/profile");
-    res.json({ ok: true, profile });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+async function send(conversationId, text) {
+  await cw(`/api/v1/accounts/${ACCOUNT}/conversations/${conversationId}/messages`, {
+    method: "POST",
+    body: {
+      content: text,
+      message_type: "outgoing"
+    }
+  });
+}
+
+// ---------------- WEBHOOK ----------------
 
 app.post("/chatwoot-webhook", async (req, res) => {
-  res.status(200).send("ok");
+  res.send("ok");
 
-  console.log("🔥 WEBHOOK CHEGOU:", new Date().toISOString(), {
-    event: req.body?.event,
-    message_type: req.body?.message_type,
-    conversationId: req.body?.conversation?.id,
-    content_preview: (req.body?.content || "").slice(0, 80),
-  });
+  const b = req.body;
 
-  try {
-    if (!assertEnv()) return;
+  console.log("🔥 webhook:", b?.event);
 
-    if (req.body?.event !== "message_created") return;
+  if (b?.event !== "message_created") return;
+  if (b.message_type !== "incoming") return;
 
-    const messageType = req.body?.message_type;
-    const isIncoming = messageType === "incoming" || messageType === 0 || messageType === "0";
-    if (!isIncoming) return;
-    if (req.body?.private) return;
+  const id = b.conversation.id;
+  const text = (b.content || "").trim();
 
-    const conversationId = req.body?.conversation?.id;
-    const customerText = (req.body?.content || "").trim();
-    if (!conversationId || !customerText) return;
+  console.log("📩", text);
 
-    console.log("📩 PROCESSANDO:", { conversationId, customerText });
-
-    // Comandos
-    const lower = customerText.toLowerCase();
-    if (lower === "#gpt on" || lower === "#gpt off") {
-      const enabled = lower.endsWith("on");
-
-      const { desired, afterLabels } = await setGptLabel(conversationId, enabled);
-
-      await sendMessageToConversation(
-        conversationId,
-        enabled
-          ? `✅ GPT ativado nesta conversa. (label: ${GPT_LABEL})`
-          : `🛑 GPT desativado nesta conversa. (label removida: ${GPT_LABEL})`
-      );
-
-      console.log("🟣 Ativar/desativar GPT via comando:", {
-        conversationId,
-        enabled,
-        desired,
-        afterLabels,
-      });
-
-      return;
-    }
-
-    // Gate por label (agora lendo labels e label_list)
-    const convo = await getConversation(conversationId);
-    const labels = extractLabels(convo);
-    const gptEnabled = labels.includes(GPT_LABEL);
-
-    if (!gptEnabled) {
-      console.log("🚫 GPT OFF (sem etiqueta). Ignorando.", { conversationId, labels });
-      return;
-    }
-
-    const context = `can_reply=${req.body?.conversation?.can_reply}; inbox=${req.body?.inbox?.name || ""}`;
-    const reply = await openaiReply({ customerText, context });
-    await sendMessageToConversation(conversationId, reply);
-    console.log("✅ Resposta enviada", { conversationId });
-  } catch (e) {
-    console.error("❌ Erro no webhook:", String(e?.message || e));
+  // comandos
+  if (text === "#gpt on") {
+    await setGPT(id, true);
+    await send(id, "✅ GPT ativado");
+    return;
   }
+
+  if (text === "#gpt off") {
+    await setGPT(id, false);
+    await send(id, "🛑 GPT desativado");
+    return;
+  }
+
+  // menu numérico = ignora
+  if (/^\d+$/.test(text)) return;
+
+  // auto ativar se fugir do menu
+  let enabled = await getGPT(id);
+
+  if (!enabled && text.length > 2) {
+    await setGPT(id, true);
+    enabled = true;
+    console.log("⚡ GPT auto ativado");
+  }
+
+  if (!enabled) return;
+
+  const reply = await gpt(text);
+  await send(id, reply);
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log("Bot ouvindo na porta", port));
+// ---------------- SERVER ----------------
+
+app.listen(process.env.PORT || 10000, async () => {
+  await login();
+  console.log("🚀 Bot online");
+});
