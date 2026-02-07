@@ -25,6 +25,17 @@ app.use(express.json({ limit: "4mb" }));
  * GPT_LABEL=gpt_on
  */
 
+// DEBUG TEMP: imprimir payload quando tiver anexo
+const hasAttachments =
+  (Array.isArray(req.body?.attachments) && req.body.attachments.length > 0) ||
+  (Array.isArray(req.body?.message?.attachments) && req.body.message.attachments.length > 0);
+
+if (hasAttachments) {
+  console.log("📎 WEBHOOK COM ANEXO (payload completo):");
+  console.log(JSON.stringify(req.body, null, 2));
+}
+// DEBUG TEMP: imprimir payload quando tiver anexo
+
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 
@@ -717,3 +728,4 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
 const port = Number(process.env.PORT || 10000);
 app.listen(port, () => console.log("🚀 Bot online na porta", port));
+
