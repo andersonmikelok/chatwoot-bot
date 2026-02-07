@@ -1,8 +1,8 @@
 {
   "name": "chatwoot-bot",
-  "version": "2.0.0",
-  "main": "index.js",
+  "version": "1.2.0",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
