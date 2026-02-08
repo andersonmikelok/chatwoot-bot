@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 
 import {
@@ -42,9 +43,11 @@ const CHATWOOT_ACCOUNT_ID = String(process.env.CHATWOOT_ACCOUNT_ID || "");
 const CW_UID = process.env.CW_UID || "";
 const CW_PASSWORD = process.env.CW_PASSWORD || "";
 
-const RECEITANET_BASE_URL = (process.env.RECEITANET_BASE_URL || "https://sistema.receitanet.net/api/novo/chatbot")
-  .replace(/\/+$/, "");
-const RECEITANET_TOKEN = process.env.RECEITANET_TOKEN || process.env.RECEITANET_CHATBOT_TOKEN || "";
+const RECEITANET_BASE_URL = (
+  process.env.RECEITANET_BASE_URL || "https://sistema.receitanet.net/api/novo/chatbot"
+).replace(/\/+$/, "");
+const RECEITANET_TOKEN =
+  process.env.RECEITANET_TOKEN || process.env.RECEITANET_CHATBOT_TOKEN || "";
 const RECEITANET_APP = process.env.RECEITANET_APP || "chatbot";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -82,8 +85,8 @@ function safeLabelList(conv) {
   return arr;
 }
 
-// ⚠️ Importante: SEU addLabels() aparentemente SUBSTITUI labels.
-// Então a gente SEMPRE manda o conjunto completo (labels atuais + novas).
+// ⚠️ Importante: addLabels() faz MERGE seguro no seu lib/chatwoot.js.
+// Aqui só garantimos que enviamos tudo que queremos manter.
 async function addLabelsMerged({ currentLabels, labelsToAdd, cw }) {
   const merged = Array.from(new Set([...(currentLabels || []), ...(labelsToAdd || [])]));
   await addLabels({
@@ -120,6 +123,21 @@ function extractWhatsAppFromPayload(payload) {
     null;
 
   return normalizePhoneBR(w || "");
+}
+
+// ✅ Backup de triagem: evita loop quando cliente digita "Suporte/Financeiro/Planos"
+// (sem depender do detectIntent do utils.js)
+function normalizeTriageKeywordIntent(rawText) {
+  const t = normalizeText(rawText).toLowerCase();
+
+  if (!t) return null;
+
+  // só palavras diretas / comuns (curtas e seguras)
+  if (t === "suporte" || t === "tecnico" || t === "técnico" || t === "ajuda") return "support";
+  if (t === "financeiro" || t === "cobranca" || t === "cobrança" || t === "pagamento") return "finance";
+  if (t === "planos" || t === "plano" || t === "comercial" || t === "vendas") return "sales";
+
+  return null;
 }
 
 export function startServer() {
@@ -194,7 +212,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 1) GPT OFF => só contador, sem responder
+      // 1) GPT OFF => só contador, sem responder (menu SMSNET manda)
       // ======================================================
       if (!gptOn) {
         if (isSmsnetMenuAnswer(customerText)) {
@@ -254,7 +272,7 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers: cwHeaders,
-            content: "✅ Entendi. Vou te atender por aqui sem precisar do menu.",
+            content: "✅ Entendi. Vou te atender por aqui e agilizar pra você 😊",
           });
 
           await sendMessage({
@@ -278,6 +296,12 @@ export function startServer() {
       // ======================================================
       // 2) GPT ON => NÃO roda contador / NÃO trata 1/2/3 como SMSNET
       // ======================================================
+
+      // ✅ algumas integrações mandam "Menu" automaticamente; com GPT ON isso só atrapalha
+      if (normalizeText(customerText).toLowerCase() === "menu" && attachments.length === 0) {
+        console.log("🛑 ignorando texto 'Menu' com GPT ON");
+        return;
+      }
 
       // ✅ welcome_sent sem apagar gpt_on
       if (!labelSet.has(LABEL_WELCOME_SENT) && !ca.welcome_sent) {
@@ -340,7 +364,12 @@ export function startServer() {
 
         if (dataUrl) {
           const dl = await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers: cwHeaders, dataUrl });
-          console.log("⬇️ download anexo", { ok: dl.ok, status: dl.status, bytes: dl.bytes, contentType: dl.contentType });
+          console.log("⬇️ download anexo", {
+            ok: dl.ok,
+            status: dl.status,
+            bytes: dl.bytes,
+            contentType: dl.contentType,
+          });
 
           if (dl.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
             const analysis = await openaiAnalyzeImage({
@@ -387,10 +416,18 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ======================================================
-      // 4) TRIAGEM (Isa) — agora 1/2/3 são atalhos do GPT, não SMSNET
+      // 4) TRIAGEM (Isa) — 1/2/3 são atalhos do GPT, não SMSNET
       // ======================================================
       const numericChoice = mapNumericChoice(customerText);
-      const intent = detectIntent(customerText, numericChoice);
+
+      // detectIntent original
+      let intent = detectIntent(customerText, numericChoice);
+
+      // ✅ anti-loop: palavras diretas (Suporte/Financeiro/Planos)
+      if (intent === "unknown") {
+        const kw = normalizeTriageKeywordIntent(customerText);
+        if (kw) intent = kw;
+      }
 
       if (state === "triage") {
         if (intent === "support") {
@@ -466,9 +503,14 @@ export function startServer() {
       }
 
       // ======================================================
-      // 5) Suporte/Financeiro seguem igual ao seu código atual
-      // (mantive só fallback GPT aqui para não alongar demais)
+      // 5) Fluxos específicos (placeholder) + fallback GPT
       // ======================================================
+
+      // ✅ Ajuste de linguagem: evitar termos como “bloqueio”
+      // Se estiver em support_check e cliente disser algo genérico, o fallback do Anderson resolve.
+      // Para financeiro completo (boleto/pix/barras) a lógica fica em outro bloco caso você queira,
+      // mas aqui mantemos o comportamento atual para não bagunçar o que já funciona.
+
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
