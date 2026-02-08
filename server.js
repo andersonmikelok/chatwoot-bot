@@ -70,6 +70,9 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 
+// timeout para chamadas externas (ReceitaNet)
+const RN_TIMEOUT_MS = Number(process.env.RN_TIMEOUT_MS || 12000);
+
 function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
@@ -84,6 +87,18 @@ function assertEnv() {
     return false;
   }
   return true;
+}
+
+function withTimeout(promise, ms, label = "timeout") {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(label), ms);
+  // se a lib de receitanet não usa fetch com signal, não aborta — mas ainda assim nosso wrapper resolve/rejeita.
+  return Promise.race([
+    promise.finally(() => clearTimeout(t)),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label}: ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 export function startServer() {
@@ -204,6 +219,190 @@ export function startServer() {
         if (!customerText && attachments.length === 0) return;
       }
 
+      // =============================
+      // FUNÇÃO: SUPORTE CHECK (RODA AGORA)
+      // =============================
+      const handleSupportCheck = async ({ cpfOverride = "" } = {}) => {
+        try {
+          // tenta achar cliente por whatsapp
+          let client = null;
+
+          if (waNormalized) {
+            client = await withTimeout(
+              rnFindClient({
+                baseUrl: RECEITANET_BASE_URL,
+                token: RECEITANET_TOKEN,
+                app: RECEITANET_APP,
+                phone: waNormalized,
+              }),
+              RN_TIMEOUT_MS,
+              "ReceitaNet rnFindClient(phone)"
+            );
+          }
+
+          // se veio CPF/CNPJ (override), usa
+          const cpfDigits = onlyDigits(cpfOverride || customerText);
+          const looksCpf = cpfDigits.length === 11 || cpfDigits.length === 14;
+
+          if (!client?.found && looksCpf) {
+            client = await withTimeout(
+              rnFindClient({
+                baseUrl: RECEITANET_BASE_URL,
+                token: RECEITANET_TOKEN,
+                app: RECEITANET_APP,
+                cpfcnpj: cpfDigits,
+              }),
+              RN_TIMEOUT_MS,
+              "ReceitaNet rnFindClient(cpfcnpj)"
+            );
+
+            await setCustomAttributesMerge({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              attrs: { cpfcnpj: cpfDigits },
+            });
+          }
+
+          // se ainda não achou, pede CPF/CNPJ
+          if (!client?.found) {
+            await setCustomAttributesMerge({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              attrs: { bot_state: "support_need_cpf", bot_agent: "anderson" },
+            });
+
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Não consegui localizar seu cadastro pelo WhatsApp.\nMe envie o *CPF ou CNPJ do titular* (somente números) para eu verificar seu acesso e possíveis bloqueios.",
+            });
+            return;
+          }
+
+          const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || storedCpf || cpfDigits || ""));
+          if (cpfUse) {
+            await setCustomAttributesMerge({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              attrs: { cpfcnpj: cpfUse },
+            });
+          }
+
+          // (opcional) verificar acesso: se você já tem isso implementado na lib
+          try {
+            await withTimeout(
+              rnVerificarAcesso({
+                baseUrl: RECEITANET_BASE_URL,
+                token: RECEITANET_TOKEN,
+                app: RECEITANET_APP,
+                cpfcnpj: cpfUse,
+              }),
+              RN_TIMEOUT_MS,
+              "ReceitaNet rnVerificarAcesso"
+            );
+          } catch {
+            // não bloqueia o fluxo se esse endpoint falhar
+          }
+
+          // lista débitos/boletos em aberto
+          const debitos = await withTimeout(
+            rnListDebitos({
+              baseUrl: RECEITANET_BASE_URL,
+              token: RECEITANET_TOKEN,
+              app: RECEITANET_APP,
+              cpfcnpj: cpfUse,
+              status: 0,
+            }),
+            RN_TIMEOUT_MS,
+            "ReceitaNet rnListDebitos"
+          );
+
+          const overdue = pickBestOverdueBoleto(debitos);
+
+          if (overdue) {
+            await setCustomAttributesMerge({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
+            });
+
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Encontrei *bloqueio por inadimplência* (boleto em aberto). Vou te enviar agora para regularizar. 👇",
+            });
+
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content: formatBoletoWhatsApp(overdue),
+            });
+
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Assim que pagar, me envie o *comprovante* aqui (foto/PDF). Eu confiro se foi o mês correto e te explico o prazo de compensação.",
+            });
+
+            return;
+          }
+
+          // sem boleto vencido -> orientação técnica
+          await sendMessage({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers: cwHeaders,
+            content:
+              "No sistema não aparece boleto vencido/bloqueio agora.\nVamos fazer um teste rápido:\n1) Desligue ONU/roteador por *2 minutos*\n2) Ligue novamente\n3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
+          });
+
+          await setCustomAttributesMerge({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers: cwHeaders,
+            attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" },
+          });
+        } catch (err) {
+          console.error("❌ SUPORTE: erro ReceitaNet", err?.message || err);
+          await sendMessage({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers: cwHeaders,
+            content:
+              "Tive uma instabilidade para consultar seu cadastro agora. 😕\nPode tentar novamente em instantes? Se preferir, me envie também o *telefone do titular com DDD* (somente números).",
+          });
+          await setCustomAttributesMerge({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers: cwHeaders,
+            attrs: { bot_state: "support_need_cpf", bot_agent: "anderson" },
+          });
+        }
+      };
+
       // -----------------------------
       // ANEXO (imagem/pdf)
       // -----------------------------
@@ -236,7 +435,6 @@ export function startServer() {
               imageDataUrl: dl.dataUri,
             });
 
-            // guarda última extração para não repetir
             await setCustomAttributesMerge({
               baseUrl: CHATWOOT_URL,
               accountId: CHATWOOT_ACCOUNT_ID,
@@ -260,7 +458,6 @@ export function startServer() {
           }
         }
 
-        // fallback: se não deu pra analisar
         if (!customerText) {
           await sendMessage({
             baseUrl: CHATWOOT_URL,
@@ -283,7 +480,6 @@ export function startServer() {
       const numericChoice = mapNumericChoice(customerText); // 1/2/3 ou null
       const intent = detectIntent(customerText, numericChoice);
 
-      // se está em triage e usuário escolheu
       if (state === "triage") {
         if (intent === "support") {
           await setCustomAttributesMerge({
@@ -340,7 +536,6 @@ export function startServer() {
           return;
         }
 
-        // se não entendeu, repete triagem
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
@@ -356,138 +551,9 @@ export function startServer() {
       // SUPORTE (Anderson)
       // -----------------------------
       if (state === "support_check") {
-        // tenta achar cliente por whatsapp
-        let client = null;
-
-        if (waNormalized) {
-          client = await rnFindClient({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            phone: waNormalized,
-          });
-        }
-
-        // se usuário mandou CPF/CNPJ nessa mensagem, usa
-        const cpfDigits = onlyDigits(customerText);
-        const looksCpf = cpfDigits.length === 11 || cpfDigits.length === 14;
-        if (!client && looksCpf) {
-          client = await rnFindClient({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            cpfcnpj: cpfDigits,
-          });
-
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            attrs: { cpfcnpj: cpfDigits },
-          });
-        }
-
-        // se ainda não achou, pede CPF/CNPJ
-        if (!client?.found) {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_state: "support_need_cpf" },
-          });
-
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content:
-              "Não consegui localizar seu cadastro pelo WhatsApp.\nMe envie o *CPF ou CNPJ do titular* (somente números) para eu verificar seu acesso e possíveis bloqueios.",
-          });
-          return;
-        }
-
-        // achou cliente -> verifica débitos/boletos
-        const cpf = client.data?.cpfCnpj || client.data?.cpfcnpj || storedCpf || "";
-        const cpfUse = onlyDigits(String(cpf || ""));
-
-        if (cpfUse) {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            attrs: { cpfcnpj: cpfUse },
-          });
-        }
-
-        const debitos = await rnListDebitos({
-          baseUrl: RECEITANET_BASE_URL,
-          token: RECEITANET_TOKEN,
-          app: RECEITANET_APP,
-          cpfcnpj: cpfUse,
-          status: 0,
-        });
-
-        const overdue = pickBestOverdueBoleto(debitos);
-
-        if (overdue) {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
-          });
-
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content:
-              "Encontrei *bloqueio por inadimplência* (boleto em aberto). Vou te enviar agora para regularizar. 👇",
-          });
-
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content: formatBoletoWhatsApp(overdue),
-          });
-
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content:
-              "Assim que pagar, me envie o *comprovante* aqui (foto/PDF). Eu confiro se foi o mês correto e te explico o prazo de compensação.",
-          });
-
-          return;
-        }
-
-        // sem boleto vencido -> ação técnica
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
-          conversationId,
-          headers: cwHeaders,
-          content:
-            "No sistema não aparece boleto vencido/bloqueio agora.\nVamos fazer um teste rápido:\n1) Desligue ONU/roteador por *2 minutos*\n2) Ligue novamente\n3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
-        });
-
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_state: "support_wait_feedback" },
-        });
+        // aqui, em vez de depender de outra mensagem, já tenta encaminhar
+        // se ainda não for possível, a função pede CPF/CNPJ.
+        await handleSupportCheck();
         return;
       }
 
@@ -509,10 +575,9 @@ export function startServer() {
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers: cwHeaders,
-          attrs: { cpfcnpj: cpfDigits, bot_state: "support_check" },
+          attrs: { cpfcnpj: cpfDigits, bot_state: "support_check", bot_agent: "anderson" },
         });
 
-        // reentra no check automaticamente com a mesma msg
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
@@ -520,6 +585,9 @@ export function startServer() {
           headers: cwHeaders,
           content: "Perfeito. Só um instante que vou verificar seu cadastro e possíveis bloqueios. ✅",
         });
+
+        // ✅ AQUI ESTÁ A CORREÇÃO: roda o check AGORA, sem esperar outra msg do cliente.
+        await handleSupportCheck({ cpfOverride: cpfDigits });
         return;
       }
 
@@ -527,7 +595,6 @@ export function startServer() {
       // FINANCEIRO (Cassia)
       // -----------------------------
       if (state === "finance_wait_need") {
-        // aceita 1/2 ou texto
         const choice = mapNumericChoice(customerText);
         const need =
           choice === 1 || /boleto|2.? via|fatura/i.test(customerText)
@@ -552,7 +619,7 @@ export function startServer() {
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers: cwHeaders,
-          attrs: { finance_need: need, bot_state: "finance_wait_cpf_or_match" },
+          attrs: { finance_need: need, bot_state: "finance_wait_cpf_or_match", bot_agent: "cassia" },
         });
 
         await sendMessage({
@@ -583,7 +650,7 @@ export function startServer() {
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers: cwHeaders,
-          attrs: { cpfcnpj: cpfDigits, bot_state: "finance_handle" },
+          attrs: { cpfcnpj: cpfDigits, bot_state: "finance_handle", bot_agent: "cassia" },
         });
 
         await sendMessage({
@@ -594,49 +661,71 @@ export function startServer() {
           content: "Beleza. Vou consultar o sistema e já te retorno. ✅",
         });
 
-        // busca débitos
-        const debitos = await rnListDebitos({
-          baseUrl: RECEITANET_BASE_URL,
-          token: RECEITANET_TOKEN,
-          app: RECEITANET_APP,
-          cpfcnpj: cpfDigits,
-          status: 0,
-        });
+        try {
+          const debitos = await withTimeout(
+            rnListDebitos({
+              baseUrl: RECEITANET_BASE_URL,
+              token: RECEITANET_TOKEN,
+              app: RECEITANET_APP,
+              cpfcnpj: cpfDigits,
+              status: 0,
+            }),
+            RN_TIMEOUT_MS,
+            "ReceitaNet rnListDebitos(finance)"
+          );
 
-        const overdue = pickBestOverdueBoleto(debitos);
+          const overdue = pickBestOverdueBoleto(debitos);
 
-        if (overdue) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content: "Encontrei boleto em aberto. Segue para pagamento 👇",
-          });
+          if (overdue) {
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content: "Encontrei boleto em aberto. Segue para pagamento 👇",
+            });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers: cwHeaders,
-            content: formatBoletoWhatsApp(overdue),
-          });
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content: formatBoletoWhatsApp(overdue),
+            });
 
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Após pagar, me envie o comprovante aqui (foto/PDF). Eu verifico se foi o *mês correto* e te aviso o prazo de compensação.",
+            });
+          } else {
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers: cwHeaders,
+              content: "No momento não aparece boleto vencido no sistema. Se você pagou agora, me envie o comprovante para eu validar. ✅",
+            });
+          }
+        } catch (err) {
+          console.error("❌ FINANCEIRO: erro ReceitaNet", err?.message || err);
           await sendMessage({
             baseUrl: CHATWOOT_URL,
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers: cwHeaders,
             content:
-              "Após pagar, me envie o comprovante aqui (foto/PDF). Eu verifico se foi o *mês correto* e te aviso o prazo de compensação.",
+              "Tive instabilidade para consultar o financeiro agora. 😕\nMe envie novamente o CPF/CNPJ em alguns instantes, por favor.",
           });
-        } else {
-          await sendMessage({
+          await setCustomAttributesMerge({
             baseUrl: CHATWOOT_URL,
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers: cwHeaders,
-            content: "No momento não aparece boleto vencido no sistema. Se você pagou agora, me envie o comprovante para eu validar. ✅",
+            attrs: { bot_state: "finance_wait_cpf_or_match", bot_agent: "cassia" },
           });
         }
 
