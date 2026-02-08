@@ -8,7 +8,7 @@ import {
   addLabel,
   setCustomAttributes,
   downloadAttachment
-} from "./biblioteca/chatwoot.js";
+} from "./lib/chatwoot.js";
 
 import {
   normalizeText,
@@ -20,10 +20,10 @@ import {
   mapNumericMenu,
   isConnectivityIssue,
   parseProofOrBoleto
-} from "./biblioteca/utils.js";
+} from "./lib/utils.js";
 
-import { rnFindClient, rnListDebitos, pickOpenBoletoFromDebitos, summarizeClient } from "./biblioteca/receitanet.js";
-import { oaiAnalyzePaymentProof, oaiFallbackReply } from "./biblioteca/openai.js";
+import { rnFindClient, rnListDebitos, pickOpenBoletoFromDebitos, summarizeClient } from "./lib/receitanet.js";
+import { oaiAnalyzePaymentProof, oaiFallbackReply } from "./lib/openai.js";
 
 // labels
 const LABEL_GPT_ON = "gpt_on";
@@ -496,3 +496,4 @@ export function createServer(env) {
 
   return app;
 }
+
