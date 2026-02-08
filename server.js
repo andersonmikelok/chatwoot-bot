@@ -416,6 +416,64 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ======================================================
+// SUPORTE — manter fluxo quando já está em support_check
+// ======================================================
+if (state === "support_check") {
+  const t = normalizeText(customerText).toLowerCase();
+
+  // resposta válida do fluxo
+  if (t.includes("todos") || t.includes("tudo")) {
+    await sendMessage({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: cwHeaders,
+      content:
+        "Entendi — a falha acontece em *todos os aparelhos*. 👍\n\n" +
+        "Vou verificar seu acesso aqui no sistema e já te retorno. ✅",
+    });
+
+    // mantém estado (não volta pra triage)
+    return;
+  }
+
+  if (t.includes("um") || t.includes("aparelho")) {
+    await sendMessage({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: cwHeaders,
+      content:
+        "Perfeito — está afetando apenas *um aparelho*. 👍\n\n" +
+        "Tente desligar e ligar o Wi-Fi desse dispositivo e me diga se volta.",
+    });
+
+    return;
+  }
+
+  // fallback do suporte (GPT Anderson)
+  const persona = buildPersonaHeader("anderson");
+  const reply = await openaiChat({
+    apiKey: OPENAI_API_KEY,
+    model: OPENAI_MODEL,
+    system: persona,
+    user: customerText,
+    maxTokens: 160,
+  });
+
+  await sendMessage({
+    baseUrl: CHATWOOT_URL,
+    accountId: CHATWOOT_ACCOUNT_ID,
+    conversationId,
+    headers: cwHeaders,
+    content: reply || "Pode me explicar melhor o que está acontecendo?",
+  });
+
+  return;
+}
+
+
+      // ======================================================
       // 4) TRIAGEM (Isa) — 1/2/3 são atalhos do GPT, não SMSNET
       // ======================================================
       const numericChoice = mapNumericChoice(customerText);
@@ -534,3 +592,4 @@ export function startServer() {
 
   app.listen(PORT, () => console.log("🚀 Bot online na porta", PORT));
 }
+
