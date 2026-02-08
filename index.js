@@ -1,6 +1,6 @@
 // index.js
 import "dotenv/config";
-import { createServer } from "./servidor.js";
+import { createServer } from "./server.js";
 
 const env = {
   // Chatwoot
@@ -39,3 +39,4 @@ const app = createServer(env);
 
 const port = process.env.PORT || 10000;
 app.listen(port, () => console.log("🚀 Bot online na porta", port));
+
