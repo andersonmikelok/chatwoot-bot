@@ -3,7 +3,6 @@ import express from "express";
 
 import {
   normalizeText,
-  onlyDigits,
   normalizePhoneBR,
   isIncomingMessage,
   extractConversationId,
@@ -59,8 +58,12 @@ const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3);
 
 // =====================
-// Helpers
+// Helpers (LOCais)
 // =====================
+function onlyDigits(s) {
+  return (s || "").toString().replace(/\D+/g, "");
+}
+
 function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
@@ -85,8 +88,6 @@ function safeLabelList(conv) {
   return arr;
 }
 
-// addLabels() do seu lib/chatwoot.js já faz MERGE seguro (GET -> union -> PATCH).
-// Aqui só garantimos que mandamos o conjunto completo desejado.
 async function addLabelsMerged({ currentLabels, labelsToAdd, cw }) {
   const merged = Array.from(new Set([...(currentLabels || []), ...(labelsToAdd || [])]));
   await addLabels({
@@ -99,13 +100,11 @@ async function addLabelsMerged({ currentLabels, labelsToAdd, cw }) {
   return merged;
 }
 
-// Menu SMSNET é só quando GPT OFF
 function isSmsnetMenuAnswer(text) {
   const t = (text || "").trim();
   return t === "1" || t === "2" || t === "3";
 }
 
-// "Fuga do menu" = não é 1/2/3 e tem texto
 function isMenuEscape(text) {
   const t = (text || "").trim();
   if (!t) return false;
@@ -125,7 +124,6 @@ function extractWhatsAppFromPayload(payload) {
   return normalizePhoneBR(w || "");
 }
 
-// Anti-loop: reconhece palavras diretas de triagem (caso detectIntent retorne unknown)
 function normalizeTriageKeywordIntent(rawText) {
   const t = normalizeText(rawText).toLowerCase();
   if (!t) return null;
@@ -210,7 +208,6 @@ export function startServer() {
       const wa = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const menuIgnoreCount = Number(ca.menu_ignore_count || 0);
 
-      // GPT ON: label OU custom_attributes
       const gptOn = labelSet.has(LABEL_GPT_ON) || ca.gpt_on === true;
 
       console.log("🔥 chegando", {
@@ -237,7 +234,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 1) GPT OFF => só contador, sem responder (menu SMSNET manda)
+      // 1) GPT OFF => só contador, sem responder
       // ======================================================
       if (!gptOn) {
         if (isSmsnetMenuAnswer(customerText)) {
@@ -317,7 +314,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 2) GPT ON => ignora "Menu" automático do provedor
+      // 2) GPT ON => ignora "Menu" automático
       // ======================================================
       if (normalizeText(customerText).toLowerCase() === "menu" && attachments.length === 0) {
         console.log("🛑 ignorando texto 'Menu' com GPT ON");
@@ -361,9 +358,6 @@ export function startServer() {
 
       // ======================================================
       // 3) LEITURA AUTOMÁTICA DE COMPROVANTE (ANEXO)
-      //    - baixa imagem
-      //    - OpenAI extrai JSON (payer_doc, amount, date)
-      //    - tenta confirmar pagamento automaticamente no ReceitaNet
       // ======================================================
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
@@ -372,7 +366,6 @@ export function startServer() {
 
         console.log("📎 anexo detectado", { fileType, hasDataUrl: Boolean(dataUrl) });
 
-        // marca estado de recebimento
         await setCustomAttributesMerge({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
@@ -393,8 +386,7 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers: cwHeaders,
-            content:
-              "📎 Recebi seu arquivo. Para eu validar no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+            content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu validar.",
           });
           await setCustomAttributesMerge({
             baseUrl: CHATWOOT_URL,
@@ -434,10 +426,8 @@ export function startServer() {
             },
           });
 
-          // tenta usar CPF/CNPJ extraído do comprovante
           const docFromReceipt = extractCpfCnpjDigits(analysis?.payer_doc || "");
 
-          // sempre dá um retorno humano rápido
           await sendMessage({
             baseUrl: CHATWOOT_URL,
             accountId: CHATWOOT_ACCOUNT_ID,
@@ -450,7 +440,6 @@ export function startServer() {
           });
 
           if (!docFromReceipt) {
-            // não achou CPF/CNPJ no comprovante
             await sendMessage({
               baseUrl: CHATWOOT_URL,
               accountId: CHATWOOT_ACCOUNT_ID,
@@ -468,7 +457,7 @@ export function startServer() {
             return;
           }
 
-          // ✅ doc encontrado no comprovante -> tenta confirmar pagamento automaticamente
+          // Confirma pagamento: se não tem débitos em aberto => OK
           try {
             const client = await rnFindClient({
               baseUrl: RECEITANET_BASE_URL,
@@ -485,7 +474,7 @@ export function startServer() {
                 conversationId,
                 headers: cwHeaders,
                 content:
-                  "Não consegui localizar esse CPF/CNPJ no sistema. Pode me enviar o CPF/CNPJ do *titular do contrato* (somente números)?",
+                  "Não consegui localizar esse CPF/CNPJ no sistema. Me envie o CPF/CNPJ do *titular do contrato* (somente números).",
               });
               await setCustomAttributesMerge({
                 baseUrl: CHATWOOT_URL,
@@ -505,7 +494,6 @@ export function startServer() {
               status: 0,
             });
 
-            // Heurística: se não há débitos em aberto, consideramos pagamento OK
             if (!Array.isArray(debitos) || debitos.length === 0) {
               await sendMessage({
                 baseUrl: CHATWOOT_URL,
@@ -514,7 +502,7 @@ export function startServer() {
                 headers: cwHeaders,
                 content:
                   "✅ *Pagamento identificado no sistema!* Obrigado.\n" +
-                  "Se o acesso ainda estiver instável, me diga se é *sem internet* ou *lento* para eu te ajudar no suporte.",
+                  "Se o acesso ainda estiver com problema, me diga se é *sem internet* ou *lento* que eu te ajudo no suporte.",
               });
 
               await setCustomAttributesMerge({
@@ -533,9 +521,21 @@ export function startServer() {
               conversationId,
               headers: cwHeaders,
               content:
-                "⏳ Ainda aparece pendência em aberto aqui. Às vezes o pagamento leva alguns minutos para compensar.\n" +
+                "⏳ Ainda aparece pendência em aberto aqui. Pode levar alguns minutos para compensar.\n" +
                 "Se quiser, eu te mando a 2ª via do boleto também.",
             });
+
+            // Envia boleto automaticamente também (se houver)
+            const boleto = pickBestOverdueBoleto(debitos);
+            if (boleto) {
+              await sendMessage({
+                baseUrl: CHATWOOT_URL,
+                accountId: CHATWOOT_ACCOUNT_ID,
+                conversationId,
+                headers: cwHeaders,
+                content: formatBoletoWhatsApp(boleto),
+              });
+            }
 
             await setCustomAttributesMerge({
               baseUrl: CHATWOOT_URL,
@@ -553,7 +553,7 @@ export function startServer() {
               conversationId,
               headers: cwHeaders,
               content:
-                "Tive uma instabilidade ao validar no sistema. Pode me enviar o *CPF/CNPJ do titular* (somente números) para eu confirmar manualmente?",
+                "Tive uma instabilidade ao validar no sistema. Me envie o *CPF/CNPJ do titular* (somente números) para eu confirmar.",
             });
             await setCustomAttributesMerge({
               baseUrl: CHATWOOT_URL,
@@ -566,14 +566,13 @@ export function startServer() {
           }
         }
 
-        // não é imagem (ou grande demais)
+        // não é imagem ou maior que 4MB
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers: cwHeaders,
-          content:
-            "📎 Recebi seu arquivo. Para eu validar no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+          content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu validar.",
         });
         await setCustomAttributesMerge({
           baseUrl: CHATWOOT_URL,
@@ -586,7 +585,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 4) Estados do FINANCEIRO: aguardando CPF/CNPJ após comprovante
+      // 4) FINANCEIRO: aguardando CPF/CNPJ depois do comprovante
       // ======================================================
       if (state === "finance_receipt_wait_doc") {
         const doc = extractCpfCnpjDigits(customerText);
@@ -601,7 +600,6 @@ export function startServer() {
           return;
         }
 
-        // tenta confirmar pagamento pela ausência de débitos
         const client = await rnFindClient({
           baseUrl: RECEITANET_BASE_URL,
           token: RECEITANET_TOKEN,
@@ -658,6 +656,17 @@ export function startServer() {
             "Se quiser, eu envio a 2ª via do boleto agora.",
         });
 
+        const boleto = pickBestOverdueBoleto(debitos);
+        if (boleto) {
+          await sendMessage({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers: cwHeaders,
+            content: formatBoletoWhatsApp(boleto),
+          });
+        }
+
         await setCustomAttributesMerge({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
@@ -669,13 +678,11 @@ export function startServer() {
       }
 
       // ======================================================
-      // 5) Suporte: manter estado (anti-loop)
-      //    Se está em support_check, NUNCA volta para triage.
+      // 5) SUPORTE (anti-loop): estados não podem cair para triage
       // ======================================================
       if (state === "support_check") {
         const t = normalizeText(customerText).toLowerCase();
 
-        // se o cliente disse "sem internet" aqui, pergunta escopo
         if (t.includes("sem internet") || t.includes("sem sinal") || t === "sem") {
           await sendMessage({
             baseUrl: CHATWOOT_URL,
@@ -694,7 +701,6 @@ export function startServer() {
           return;
         }
 
-        // se o cliente disse lento/instável
         if (t.includes("lento") || t.includes("inst") || t.includes("oscila")) {
           await sendMessage({
             baseUrl: CHATWOOT_URL,
@@ -715,7 +721,6 @@ export function startServer() {
           return;
         }
 
-        // fallback do Anderson
         const persona = buildPersonaHeader("anderson");
         const reply = await openaiChat({
           apiKey: OPENAI_API_KEY,
@@ -735,7 +740,6 @@ export function startServer() {
         return;
       }
 
-      // suporte: escolher aparelhos
       if (state === "support_scope_devices") {
         const t = normalizeText(customerText).toLowerCase();
 
@@ -826,7 +830,6 @@ export function startServer() {
 
         const idCliente = client?.data?.idCliente || client?.data?.id || client?.data?.cliente_id || "";
 
-        // Verificar acesso
         const rAcesso = await rnVerificarAcesso({
           baseUrl: RECEITANET_BASE_URL,
           token: RECEITANET_TOKEN,
@@ -835,7 +838,6 @@ export function startServer() {
           contato: wa || "",
         });
 
-        // Se API sinalizar pendência (ok false), manda boleto automaticamente
         if (!rAcesso.ok) {
           const debitos = await rnListDebitos({
             baseUrl: RECEITANET_BASE_URL,
@@ -852,7 +854,9 @@ export function startServer() {
               accountId: CHATWOOT_ACCOUNT_ID,
               conversationId,
               headers: cwHeaders,
-              content: formatBoletoWhatsApp(boleto) + "\n\nApós o pagamento, me envie o *comprovante* aqui que eu confirmo pra você. ✅",
+              content:
+                formatBoletoWhatsApp(boleto) +
+                "\n\nApós o pagamento, envie o *comprovante* aqui que eu confirmo pra você. ✅",
             });
             await setCustomAttributesMerge({
               baseUrl: CHATWOOT_URL,
@@ -884,7 +888,6 @@ export function startServer() {
           return;
         }
 
-        // acesso ok: checklist rápido
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
@@ -892,7 +895,7 @@ export function startServer() {
           headers: cwHeaders,
           content:
             "✅ Seu acesso está *normal* no sistema.\n" +
-            "Vamos fazer um teste rápido: desligue o roteador/ONT por *30 segundos*, ligue novamente e me diga se voltou.",
+            "Teste rápido: desligue o roteador/ONT por *30 segundos*, ligue novamente e me diga se voltou.",
         });
 
         await setCustomAttributesMerge({
@@ -931,7 +934,7 @@ export function startServer() {
             conversationId,
             headers: cwHeaders,
             content:
-              "Entendi. Vou encaminhar para nosso time técnico verificar a conexão. 👍\n" +
+              "Entendi. Vou encaminhar para o time técnico verificar a conexão. 👍\n" +
               "Se puder, me diga se alguma luz da ONU/roteador está *vermelha* ou *piscando* (ex: LOS).",
           });
           await setCustomAttributesMerge({
@@ -955,7 +958,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 6) TRIAGEM (Isa) — 1/2/3 são atalhos do GPT
+      // 6) TRIAGEM
       // ======================================================
       if (!customerText && attachments.length === 0) return;
 
@@ -965,8 +968,6 @@ export function startServer() {
         const kw = normalizeTriageKeywordIntent(customerText);
         if (kw) intent = kw;
       }
-
-      // Atalho: se o cliente falar "paguei/comprovante" vai para financeiro
       if (isPaymentIntent(customerText)) intent = "finance";
 
       if (state === "triage") {
@@ -1045,7 +1046,7 @@ export function startServer() {
       }
 
       // ======================================================
-      // 7) Fallback GPT por persona (sem quebrar estados)
+      // 7) fallback GPT por persona
       // ======================================================
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
