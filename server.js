@@ -23,9 +23,6 @@ import {
 import {
   rnFindClient,
   rnListDebitos,
-  rnVerificarAcesso,
-  pickBestOverdueBoleto,
-  formatBoletoWhatsApp,
 } from "./lib/receitanet.js";
 
 import { openaiChat } from "./lib/openai.js";
@@ -79,10 +76,10 @@ export function startServer() {
 
       console.log("🔥 fluxo", { conversationId, text, state });
 
-      // ======================================
-      // SUPORTE — aguardando CPF
-      // ======================================
-      if (state === "support_wait_doc") {
+      // =====================================
+      // CONFIRMAÇÃO DE PAGAMENTO
+      // =====================================
+      if (state === "payment_check") {
         const doc = onlyDigits(text);
 
         if (doc.length !== 11 && doc.length !== 14) {
@@ -91,7 +88,7 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers,
-            content: "Envie CPF ou CNPJ apenas com números.",
+            content: "Envie CPF/CNPJ apenas com números.",
           });
           return;
         }
@@ -109,85 +106,67 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers,
-            content: "Cadastro não encontrado — confirme o CPF/CNPJ.",
+            content: "Cadastro não encontrado.",
           });
           return;
         }
 
-        const acesso = await rnVerificarAcesso({
+        const debitos = await rnListDebitos({
           baseUrl: RECEITANET_BASE_URL,
           token: RECEITANET_TOKEN,
           app: RECEITANET_APP,
-          idCliente: client.data.idCliente,
+          cpfcnpj: doc,
         });
 
-        // 🔴 pendência → boleto automático
-        if (!acesso.ok) {
-          const debitos = await rnListDebitos({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            cpfcnpj: doc,
+        if (!debitos.length) {
+          await sendMessage({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers,
+            content:
+              "Pagamento identificado 👍\n\nAcesso normalizado.",
           });
 
-          const boleto = pickBestOverdueBoleto(debitos);
-
-          if (boleto) {
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
-              conversationId,
-              headers,
-              content: formatBoletoWhatsApp(boleto),
-            });
-          } else {
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
-              conversationId,
-              headers,
-              content: "Existe pendência, mas não consegui gerar boleto automático.",
-            });
-          }
+          await setCustomAttributesMerge({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers,
+            attrs: { bot_state: "triage" },
+          });
 
           return;
         }
 
-        // acesso normal
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers,
           content:
-            "Seu acesso está ativo 👍\n\n" +
-            "Desligue o roteador por 30s e me avise.",
-        });
-
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
-          conversationId,
-          headers,
-          attrs: { bot_state: "support_reboot" },
+            "Pagamento ainda não compensou.\n\nPode levar alguns minutos.",
         });
 
         return;
       }
 
-      // ======================================
+      // =====================================
       // TRIAGEM
-      // ======================================
+      // =====================================
       const numeric = mapNumericChoice(text);
       const intent = detectIntent(text, numeric);
 
-      if (intent === "support") {
+      if (
+        text.toLowerCase().includes("paguei") ||
+        text.toLowerCase().includes("comprovante")
+      ) {
         await setCustomAttributesMerge({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers,
-          attrs: { bot_state: "support_wait_doc" },
+          attrs: { bot_state: "payment_check" },
         });
 
         await sendMessage({
@@ -196,7 +175,7 @@ export function startServer() {
           conversationId,
           headers,
           content:
-            "Sem internet — me envie CPF/CNPJ para verificar acesso.",
+            "Perfeito — me envie CPF/CNPJ para confirmar pagamento.",
         });
 
         return;
