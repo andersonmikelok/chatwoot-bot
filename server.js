@@ -64,6 +64,11 @@ function onlyDigits(s) {
   return (s || "").toString().replace(/\D+/g, "");
 }
 
+function is401(err) {
+  const msg = String(err?.message || err || "");
+  return msg.includes("(401)") || msg.includes(" 401 ") || msg.includes("failed (401)") || msg.includes("status\":401");
+}
+
 function assertEnv() {
   const missing = [];
   if (!CHATWOOT_URL) missing.push("CHATWOOT_URL");
@@ -163,6 +168,117 @@ function isPaymentIntent(text) {
   );
 }
 
+// =====================
+// Chatwoot Retry Wrappers (401)
+// =====================
+async function cwAuth({ force = false }) {
+  const auth = await chatwootSignInIfNeeded({
+    baseUrl: CHATWOOT_URL,
+    email: CW_UID,
+    password: CW_PASSWORD,
+    force,
+  });
+  const headers = buildAuthHeaders({ ...auth, uid: auth.uid || CW_UID });
+  return headers;
+}
+
+async function cwGetConversationRetry({ conversationId, headers }) {
+  try {
+    return await getConversation({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+    });
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no getConversation -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await getConversation({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+    });
+  }
+}
+
+async function cwSendMessageRetry({ conversationId, headers, content }) {
+  try {
+    return await sendMessage({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+      content,
+    });
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no sendMessage -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await sendMessage({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+      content,
+    });
+  }
+}
+
+async function cwSetAttrsRetry({ conversationId, headers, attrs }) {
+  try {
+    return await setCustomAttributesMerge({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+      attrs,
+    });
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no setCustomAttributes -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await setCustomAttributesMerge({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+      attrs,
+    });
+  }
+}
+
+async function cwAddLabelsRetry({ conversationId, headers, currentLabels, labelsToAdd }) {
+  try {
+    return await addLabelsMerged({
+      currentLabels,
+      labelsToAdd,
+      cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers },
+    });
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no addLabels -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await addLabelsMerged({
+      currentLabels,
+      labelsToAdd,
+      cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers: h2 },
+    });
+  }
+}
+
+async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
+  try {
+    return await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers, dataUrl });
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no downloadAttachment -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers: h2, dataUrl });
+  }
+}
+
 export function startServer() {
   const app = express();
   app.use(express.json({ limit: "15mb" }));
@@ -184,19 +300,9 @@ export function startServer() {
       const customerText = normalizeText(customerTextRaw);
       const attachments = extractAttachments(req.body);
 
-      const auth = await chatwootSignInIfNeeded({
-        baseUrl: CHATWOOT_URL,
-        email: CW_UID,
-        password: CW_PASSWORD,
-      });
-      const cwHeaders = buildAuthHeaders({ ...auth, uid: auth.uid || CW_UID });
-
-      const conv = await getConversation({
-        baseUrl: CHATWOOT_URL,
-        accountId: CHATWOOT_ACCOUNT_ID,
-        conversationId,
-        headers: cwHeaders,
-      });
+      // auth + getConversation com retry 401
+      let cwHeaders = await cwAuth({ force: false });
+      let conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
 
       const labels = safeLabelList(conv);
       const labelSet = new Set(labels);
@@ -222,11 +328,9 @@ export function startServer() {
         gpt_on: gptOn,
       });
 
-      // salva whatsapp
+      // salva whatsapp (retry 401)
       if (wa && wa !== (ca.whatsapp_phone || "")) {
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { whatsapp_phone: wa },
@@ -239,9 +343,7 @@ export function startServer() {
       if (!gptOn) {
         if (isSmsnetMenuAnswer(customerText)) {
           if (menuIgnoreCount !== 0) {
-            await setCustomAttributesMerge({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
               attrs: { menu_ignore_count: 0 },
@@ -255,9 +357,7 @@ export function startServer() {
           const nextCount = menuIgnoreCount + 1;
           console.log("🟡 ignorou menu", { conversationId, nextCount, limit: AUTO_GPT_THRESHOLD });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { menu_ignore_count: nextCount },
@@ -267,15 +367,14 @@ export function startServer() {
 
           console.log("⚡ GPT autoativado (limite atingido) => aplicando label gpt_on");
 
-          const newLabels = await addLabelsMerged({
+          const newLabels = await cwAddLabelsRetry({
+            conversationId,
+            headers: cwHeaders,
             currentLabels: labels,
             labelsToAdd: [LABEL_GPT_ON],
-            cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers: cwHeaders },
           });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: {
@@ -287,17 +386,13 @@ export function startServer() {
             },
           });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "✅ Entendi. Vou te atender por aqui e agilizar pra você 😊",
           });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -323,23 +418,20 @@ export function startServer() {
 
       // welcome
       if (!labelSet.has(LABEL_WELCOME_SENT) && !ca.welcome_sent) {
-        const merged = await addLabelsMerged({
+        const merged = await cwAddLabelsRetry({
+          conversationId,
+          headers: cwHeaders,
           currentLabels: labels,
           labelsToAdd: [LABEL_GPT_ON, LABEL_WELCOME_SENT],
-          cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers: cwHeaders },
         });
 
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa", welcome_sent: true },
         });
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content:
@@ -366,9 +458,7 @@ export function startServer() {
 
         console.log("📎 anexo detectado", { fileType, hasDataUrl: Boolean(dataUrl) });
 
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: {
@@ -381,16 +471,12 @@ export function startServer() {
         });
 
         if (!dataUrl) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu validar.",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "finance_receipt_wait_doc" },
@@ -398,7 +484,7 @@ export function startServer() {
           return;
         }
 
-        const dl = await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers: cwHeaders, dataUrl });
+        const dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
         console.log("⬇️ download anexo", {
           ok: dl.ok,
           status: dl.status,
@@ -413,9 +499,7 @@ export function startServer() {
             imageDataUrl: dl.dataUri,
           });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: {
@@ -428,9 +512,7 @@ export function startServer() {
 
           const docFromReceipt = extractCpfCnpjDigits(analysis?.payer_doc || "");
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -440,16 +522,12 @@ export function startServer() {
           });
 
           if (!docFromReceipt) {
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSendMessageRetry({
               conversationId,
               headers: cwHeaders,
               content: "Para eu confirmar o pagamento, me envie o *CPF ou CNPJ do titular* (somente números).",
             });
-            await setCustomAttributesMerge({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
               attrs: { bot_state: "finance_receipt_wait_doc" },
@@ -457,7 +535,6 @@ export function startServer() {
             return;
           }
 
-          // Confirma pagamento: se não tem débitos em aberto => OK
           try {
             const client = await rnFindClient({
               baseUrl: RECEITANET_BASE_URL,
@@ -468,17 +545,13 @@ export function startServer() {
             });
 
             if (!client.found) {
-              await sendMessage({
-                baseUrl: CHATWOOT_URL,
-                accountId: CHATWOOT_ACCOUNT_ID,
+              await cwSendMessageRetry({
                 conversationId,
                 headers: cwHeaders,
                 content:
                   "Não consegui localizar esse CPF/CNPJ no sistema. Me envie o CPF/CNPJ do *titular do contrato* (somente números).",
               });
-              await setCustomAttributesMerge({
-                baseUrl: CHATWOOT_URL,
-                accountId: CHATWOOT_ACCOUNT_ID,
+              await cwSetAttrsRetry({
                 conversationId,
                 headers: cwHeaders,
                 attrs: { bot_state: "finance_receipt_wait_doc" },
@@ -495,9 +568,7 @@ export function startServer() {
             });
 
             if (!Array.isArray(debitos) || debitos.length === 0) {
-              await sendMessage({
-                baseUrl: CHATWOOT_URL,
-                accountId: CHATWOOT_ACCOUNT_ID,
+              await cwSendMessageRetry({
                 conversationId,
                 headers: cwHeaders,
                 content:
@@ -505,9 +576,7 @@ export function startServer() {
                   "Se o acesso ainda estiver com problema, me diga se é *sem internet* ou *lento* que eu te ajudo no suporte.",
               });
 
-              await setCustomAttributesMerge({
-                baseUrl: CHATWOOT_URL,
-                accountId: CHATWOOT_ACCOUNT_ID,
+              await cwSetAttrsRetry({
                 conversationId,
                 headers: cwHeaders,
                 attrs: { bot_state: "triage", bot_agent: "isa" },
@@ -515,9 +584,7 @@ export function startServer() {
               return;
             }
 
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSendMessageRetry({
               conversationId,
               headers: cwHeaders,
               content:
@@ -525,21 +592,16 @@ export function startServer() {
                 "Se quiser, eu te mando a 2ª via do boleto também.",
             });
 
-            // Envia boleto automaticamente também (se houver)
             const boleto = pickBestOverdueBoleto(debitos);
             if (boleto) {
-              await sendMessage({
-                baseUrl: CHATWOOT_URL,
-                accountId: CHATWOOT_ACCOUNT_ID,
+              await cwSendMessageRetry({
                 conversationId,
                 headers: cwHeaders,
                 content: formatBoletoWhatsApp(boleto),
               });
             }
 
-            await setCustomAttributesMerge({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
               attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
@@ -547,17 +609,13 @@ export function startServer() {
             return;
           } catch (e) {
             console.error("❌ erro confirmação via comprovante:", e?.message || e);
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSendMessageRetry({
               conversationId,
               headers: cwHeaders,
               content:
                 "Tive uma instabilidade ao validar no sistema. Me envie o *CPF/CNPJ do titular* (somente números) para eu confirmar.",
             });
-            await setCustomAttributesMerge({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
               attrs: { bot_state: "finance_receipt_wait_doc" },
@@ -566,17 +624,12 @@ export function startServer() {
           }
         }
 
-        // não é imagem ou maior que 4MB
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu validar.",
         });
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { bot_state: "finance_receipt_wait_doc" },
@@ -590,9 +643,7 @@ export function startServer() {
       if (state === "finance_receipt_wait_doc") {
         const doc = extractCpfCnpjDigits(customerText);
         if (!doc) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Me envie o *CPF ou CNPJ* (somente números), por favor.",
@@ -609,9 +660,7 @@ export function startServer() {
         });
 
         if (!client.found) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Não encontrei esse CPF/CNPJ no sistema. Confere e me envie novamente (somente números).",
@@ -628,17 +677,13 @@ export function startServer() {
         });
 
         if (!Array.isArray(debitos) || debitos.length === 0) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "✅ *Pagamento identificado no sistema!* Obrigado. 😊",
           });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "triage", bot_agent: "isa" },
@@ -646,9 +691,7 @@ export function startServer() {
           return;
         }
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content:
@@ -658,18 +701,14 @@ export function startServer() {
 
         const boleto = pickBestOverdueBoleto(debitos);
         if (boleto) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: formatBoletoWhatsApp(boleto),
           });
         }
 
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
@@ -684,16 +723,12 @@ export function startServer() {
         const t = normalizeText(customerText).toLowerCase();
 
         if (t.includes("sem internet") || t.includes("sem sinal") || t === "sem") {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Entendi 👍 Está acontecendo em *um aparelho* ou em *todos*?",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "support_scope_devices", bot_agent: "anderson" },
@@ -702,18 +737,14 @@ export function startServer() {
         }
 
         if (t.includes("lento") || t.includes("inst") || t.includes("oscila")) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
               "Certo 👍 É no *Wi-Fi* ou também no *cabo*?\n" +
               "Responda: *wifi*, *cabo* ou *ambos*.",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "support_quality_scope", bot_agent: "anderson" },
@@ -730,9 +761,7 @@ export function startServer() {
           maxTokens: 170,
         });
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content: reply || "Pode me dizer se é *sem internet* ou *lento/instável*?",
@@ -744,9 +773,7 @@ export function startServer() {
         const t = normalizeText(customerText).toLowerCase();
 
         if (t.includes("todos") || t.includes("tudo") || t.includes("nenhum") || t.includes("geral")) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -755,9 +782,7 @@ export function startServer() {
               "Me envie o *CPF/CNPJ do titular* (somente números).",
           });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "support_wait_doc", bot_agent: "anderson" },
@@ -766,9 +791,7 @@ export function startServer() {
         }
 
         if (t.includes("um") || t.includes("só um") || t.includes("apenas um")) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -776,9 +799,7 @@ export function startServer() {
               "Tente: *esquecer a rede Wi-Fi* e conectar novamente.\n" +
               "Se continuar, me diga qual aparelho é (celular/TV/notebook).",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "support_single_device_help", bot_agent: "anderson" },
@@ -786,9 +807,7 @@ export function startServer() {
           return;
         }
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content: "Só pra eu confirmar: é em *um aparelho* ou em *todos*?",
@@ -799,9 +818,7 @@ export function startServer() {
       if (state === "support_wait_doc") {
         const doc = extractCpfCnpjDigits(customerText);
         if (!doc) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Me envie o *CPF ou CNPJ* (somente números), por favor.",
@@ -818,9 +835,7 @@ export function startServer() {
         });
 
         if (!client.found) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Não encontrei esse CPF/CNPJ no sistema. Confere e me envie novamente (somente números).",
@@ -849,18 +864,14 @@ export function startServer() {
 
           const boleto = pickBestOverdueBoleto(debitos);
           if (boleto) {
-            await sendMessage({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSendMessageRetry({
               conversationId,
               headers: cwHeaders,
               content:
                 formatBoletoWhatsApp(boleto) +
                 "\n\nApós o pagamento, envie o *comprovante* aqui que eu confirmo pra você. ✅",
             });
-            await setCustomAttributesMerge({
-              baseUrl: CHATWOOT_URL,
-              accountId: CHATWOOT_ACCOUNT_ID,
+            await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
               attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
@@ -868,9 +879,7 @@ export function startServer() {
             return;
           }
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -878,9 +887,7 @@ export function startServer() {
               "Você quer *boleto/2ª via* ou prefere *PIX*?",
           });
 
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
@@ -888,9 +895,7 @@ export function startServer() {
           return;
         }
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content:
@@ -898,9 +903,7 @@ export function startServer() {
             "Teste rápido: desligue o roteador/ONT por *30 segundos*, ligue novamente e me diga se voltou.",
         });
 
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { bot_state: "support_reboot", bot_agent: "anderson" },
@@ -910,16 +913,12 @@ export function startServer() {
 
       if (state === "support_reboot") {
         if (looksLikeYes(customerText)) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Perfeito! ✅ Internet normalizada. Posso ajudar em mais alguma coisa?",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "triage", bot_agent: "isa" },
@@ -928,18 +927,14 @@ export function startServer() {
         }
 
         if (looksLikeNo(customerText)) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
               "Entendi. Vou encaminhar para o time técnico verificar a conexão. 👍\n" +
               "Se puder, me diga se alguma luz da ONU/roteador está *vermelha* ou *piscando* (ex: LOS).",
           });
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { bot_state: "support_escalated", bot_agent: "anderson" },
@@ -947,9 +942,7 @@ export function startServer() {
           return;
         }
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content: "Só confirmando: após reiniciar, *voltou* ou *não voltou*?",
@@ -972,17 +965,13 @@ export function startServer() {
 
       if (state === "triage") {
         if (intent === "support") {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { gpt_on: true, bot_agent: "anderson", bot_state: "support_check" },
           });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -993,17 +982,13 @@ export function startServer() {
         }
 
         if (intent === "finance") {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { gpt_on: true, bot_agent: "cassia", bot_state: "finance_wait_need" },
           });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content:
@@ -1015,17 +1000,13 @@ export function startServer() {
         }
 
         if (intent === "sales") {
-          await setCustomAttributesMerge({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
             attrs: { gpt_on: true, bot_agent: "isa", bot_state: "sales_flow" },
           });
 
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
+          await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Perfeito! Me diga seu *bairro* e *cidade* para eu te informar cobertura e planos. 😊",
@@ -1033,9 +1014,7 @@ export function startServer() {
           return;
         }
 
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
+        await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
           content:
@@ -1045,9 +1024,7 @@ export function startServer() {
         return;
       }
 
-      // ======================================================
-      // 7) fallback GPT por persona
-      // ======================================================
+      // fallback GPT
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
@@ -1057,9 +1034,7 @@ export function startServer() {
         maxTokens: 180,
       });
 
-      await sendMessage({
-        baseUrl: CHATWOOT_URL,
-        accountId: CHATWOOT_ACCOUNT_ID,
+      await cwSendMessageRetry({
         conversationId,
         headers: cwHeaders,
         content: reply || "Certo! Pode me explicar um pouco melhor o que você precisa?",
