@@ -1,4 +1,4 @@
-// server.js
+// server.js (COMPLETO) — GPT só ativa com #gpt_on (contador mantido, porém ignorado)
 import express from "express";
 
 import {
@@ -211,9 +211,13 @@ function chunkString(str, maxLen = 1200) {
   return parts;
 }
 
+/**
+ * ✅ Anti-loop global: ignora mensagens automáticas do SMSNET
+ */
 function isSmsnetSystemMessage(text) {
   const t = normalizeText(text).toLowerCase();
   if (!t) return false;
+
   if (t.includes("digite o número")) return true;
   if (t.includes("por favor digite um número válido")) return true;
   if (t.includes("consultar planos")) return true;
@@ -221,6 +225,7 @@ function isSmsnetSystemMessage(text) {
   if (t.includes("contatos / endereço")) return true;
   if (t.includes("[1]") || t.includes("[2]") || t.includes("[3]")) return true;
   if (t.startsWith("menu")) return true;
+
   return false;
 }
 
@@ -481,12 +486,16 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     await cwSetAttrsRetry({
       conversationId,
       headers,
-      attrs: { bot_state: "finance_wait_need", bot_agent: "cassia", last_cpfcnpj: cpfcnpj, finance_id_cliente: idCliente },
+      attrs: {
+        bot_state: "finance_wait_need",
+        bot_agent: "cassia",
+        last_cpfcnpj: cpfcnpj,
+        finance_id_cliente: idCliente,
+      },
     });
     return { ok: false, reason: "no_boleto" };
   }
 
-  // ✅ salva somente o necessário (evita estourar tamanho)
   await cwSetAttrsRetry({
     conversationId,
     headers,
@@ -592,7 +601,9 @@ export function startServer() {
       const wa = normalizePhoneBR(waPayload || "");
       const menuIgnoreCount = Number(ca.menu_ignore_count || 0);
 
-      const gptOn = labelSet.has(LABEL_GPT_ON) || ca.gpt_on === true;
+      // 🔥 MODO TESTE PRODUÇÃO:
+      // GPT só liga via comando #gpt_on (IGNORA labels e IGNORA contador)
+      const gptOn = ca.gpt_on === true;
 
       console.log("🔥 chegando", {
         conversationId,
@@ -614,8 +625,56 @@ export function startServer() {
         });
       }
 
-      // GPT OFF: só contador
+      // =======================
+      // Comandos manuais (produção)
+      // =======================
+      const cmd = (customerText || "").trim().toLowerCase();
+
+      if (cmd.includes("#gpt_on")) {
+        await cwSetAttrsRetry({
+          conversationId,
+          headers: cwHeaders,
+          attrs: {
+            gpt_on: true,
+            menu_ignore_count: 0, // zera contador, mas continua existindo
+            bot_state: "triage",
+            bot_agent: "isa",
+            welcome_sent: false,
+          },
+        });
+
+        await cwSendMessageRetry({
+          conversationId,
+          headers: cwHeaders,
+          content: "✅ Modo GPT ativado para esta conversa. Pode mandar sua solicitação 😊",
+        });
+        return;
+      }
+
+      if (cmd.includes("#gpt_off")) {
+        await cwSetAttrsRetry({
+          conversationId,
+          headers: cwHeaders,
+          attrs: {
+            gpt_on: false,
+            bot_state: "triage",
+            bot_agent: "isa",
+          },
+        });
+
+        await cwSendMessageRetry({
+          conversationId,
+          headers: cwHeaders,
+          content: "🛑 Modo GPT desativado para esta conversa.",
+        });
+        return;
+      }
+
+      // =======================
+      // GPT OFF (contador mantido, mas IGNORADO)
+      // =======================
       if (!gptOn) {
+        // mantém o contador atualizado, mas NÃO ativa GPT automaticamente
         if (isSmsnetMenuAnswer(customerText)) {
           if (menuIgnoreCount !== 0) {
             await cwSetAttrsRetry({
@@ -634,43 +693,21 @@ export function startServer() {
             headers: cwHeaders,
             attrs: { menu_ignore_count: nextCount },
           });
-
-          if (nextCount < AUTO_GPT_THRESHOLD) return;
-
-          await cwAddLabelsRetry({
-            conversationId,
-            headers: cwHeaders,
-            currentLabels: labels,
-            labelsToAdd: [LABEL_GPT_ON],
-          });
-
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: {
-              gpt_on: true,
-              menu_ignore_count: 0,
-              bot_state: "triage",
-              bot_agent: "isa",
-              welcome_sent: false,
-            },
-          });
-
-          await cwSendMessageRetry({
-            conversationId,
-            headers: cwHeaders,
-            content: "✅ Entendi. Vou te atender por aqui e agilizar pra você 😊",
-          });
-
+          // ❌ não faz auto-ativação
           return;
         }
 
         return;
       }
 
+      // =======================
+      // GPT ON (fluxos)
+      // =======================
+
       // CPF/CNPJ automático
       const cpfcnpjInText = extractCpfCnpjDigits(customerText);
       if (cpfcnpjInText && (state === "triage" || String(state || "").startsWith("finance"))) {
+        // aqui o label ainda pode existir, mas não é mais necessário pra ligar GPT
         if (!labelSet.has(LABEL_WELCOME_SENT) && !ca.welcome_sent) {
           await cwAddLabelsRetry({
             conversationId,
@@ -681,7 +718,7 @@ export function startServer() {
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
-            attrs: { welcome_sent: true, gpt_on: true },
+            attrs: { welcome_sent: true },
           });
         }
 
@@ -714,10 +751,9 @@ export function startServer() {
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
-          attrs: { gpt_on: true, bot_agent: "cassia", bot_state: "finance_receipt_processing" },
+          attrs: { bot_agent: "cassia", bot_state: "finance_receipt_processing" },
         });
 
-        // sem dataUrl: só pede doc se não tiver last_cpfcnpj
         if (!dataUrl) {
           const docFallback = String(ca?.last_cpfcnpj || "").trim();
           if (!docFallback) {
@@ -797,13 +833,11 @@ export function startServer() {
             "\n\nSó um instante que vou conferir se está referente ao boleto em aberto. ✅",
         });
 
-        // Se faltar idCliente/boleto atual, tenta recarregar pelo last_cpfcnpj sem reenviar boleto
         let boletoAtual = ca?.finance_current_boleto || null;
         let idCliente = String(ca?.finance_id_cliente || "").trim();
 
         if (!idCliente || !boletoAtual) {
           const docFallback = String(ca?.last_cpfcnpj || "").trim();
-
           if (docFallback) {
             await financeSendBoletoByDoc({
               conversationId,
@@ -813,7 +847,6 @@ export function startServer() {
               silent: true,
             });
 
-            // Recarrega conversa pra ler os attrs recém salvos
             conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
             const ca2 = conv?.custom_attributes || {};
             boletoAtual = ca2?.finance_current_boleto || boletoAtual;
@@ -836,9 +869,8 @@ export function startServer() {
         }
 
         const match = receiptMatchesBoleto({ analysis, boleto: boletoAtual });
-
         const hasRecLine = normalizeDigits(analysis?.barcode_or_line || "").length >= 40;
-        const requireStrong = hasRecLine; // se tem código/linha, precisa bater igual
+        const requireStrong = hasRecLine;
         const okMatch = requireStrong ? match.strong : match.ok;
 
         console.log("📎 [ATT] match", { ...match, requireStrong, okMatch });
@@ -861,7 +893,6 @@ export function startServer() {
           return;
         }
 
-        // ✅ Notificação de pagamento com proteção contra erro (evita “travou”)
         try {
           const notif = await rnNotificacaoPagamento({
             baseUrl: RECEITANET_BASE_URL,
@@ -941,7 +972,7 @@ export function startServer() {
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
-            attrs: { gpt_on: true, bot_agent: "cassia", bot_state: "finance_wait_doc" },
+            attrs: { bot_agent: "cassia", bot_state: "finance_wait_doc" },
           });
 
           await cwSendMessageRetry({
@@ -958,7 +989,7 @@ export function startServer() {
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
-            attrs: { gpt_on: true, bot_agent: "anderson", bot_state: "support_check" },
+            attrs: { bot_agent: "anderson", bot_state: "support_check" },
           });
 
           await cwSendMessageRetry({
@@ -975,7 +1006,7 @@ export function startServer() {
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
-            attrs: { gpt_on: true, bot_agent: "isa", bot_state: "sales_flow" },
+            attrs: { bot_agent: "isa", bot_state: "sales_flow" },
           });
 
           await cwSendMessageRetry({
@@ -994,7 +1025,7 @@ export function startServer() {
         return;
       }
 
-      // fallback GPT
+      // fallback GPT (mais controlado)
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
