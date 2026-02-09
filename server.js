@@ -432,6 +432,34 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa }) 
   const boleto = pickBestOverdueBoleto(debitos);
   console.log("🧾 [FIN] pickBestOverdueBoleto", { has: Boolean(boleto), venc: boleto?.vencimento || "" });
 
+  // 🔎 DEBUG: mostra 1 ou 2 boletos "brutos" (mascarado) pra ajustar o mapeamento
+try {
+  const bcol = debitos?.[0]?.boletos;
+  const keys = bcol && typeof bcol === "object" ? Object.keys(bcol).slice(0, 3) : [];
+  const raw0 = Array.isArray(bcol) ? bcol[0] : (keys.length ? bcol[keys[0]] : null);
+  const raw1 = Array.isArray(bcol) ? bcol[1] : (keys.length > 1 ? bcol[keys[1]] : null);
+
+  const mask = (x) => {
+    const s = typeof x === "string" ? x : JSON.stringify(x);
+    if (!s) return s;
+    return s
+      .replace(/\d{11,14}/g, "[DOC]")
+      .replace(/\d{44,}/g, "[CODIGO_LONGO]")
+      .slice(0, 1200);
+  };
+
+  console.log("🧾 [FIN][DEBUG] boletos container type", {
+    isArray: Array.isArray(bcol),
+    type: typeof bcol,
+    keys_sample: keys,
+  });
+  console.log("🧾 [FIN][DEBUG] boleto raw0:", mask(raw0));
+  console.log("🧾 [FIN][DEBUG] boleto raw1:", mask(raw1));
+} catch (e) {
+  console.log("🧾 [FIN][DEBUG] erro ao logar boleto bruto:", String(e?.message || e));
+}
+
+
   if (!boleto) {
     await cwSendMessageRetry({
       conversationId,
@@ -775,3 +803,4 @@ export function startServer() {
 
   app.listen(PORT, () => console.log("🚀 Bot online na porta", PORT));
 }
+
