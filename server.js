@@ -22,7 +22,10 @@ import {
 
 import {
   rnFindClient,
+  rnListDebitos,
   rnVerificarAcesso,
+  pickBestOverdueBoleto,
+  formatBoletoWhatsApp,
 } from "./lib/receitanet.js";
 
 import { openaiChat } from "./lib/openai.js";
@@ -53,8 +56,6 @@ export function startServer() {
       if (shouldIgnoreDuplicateEvent(req.body)) return;
 
       const conversationId = extractConversationId(req.body);
-      if (!conversationId) return;
-
       const text = normalizeText(extractMessageText(req.body));
       if (!text) return;
 
@@ -78,9 +79,9 @@ export function startServer() {
 
       console.log("🔥 fluxo", { conversationId, text, state });
 
-      // =====================================================
+      // ======================================
       // SUPORTE — aguardando CPF
-      // =====================================================
+      // ======================================
       if (state === "support_wait_doc") {
         const doc = onlyDigits(text);
 
@@ -90,7 +91,7 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers,
-            content: "Envie apenas CPF ou CNPJ com números.",
+            content: "Envie CPF ou CNPJ apenas com números.",
           });
           return;
         }
@@ -108,7 +109,7 @@ export function startServer() {
             accountId: CHATWOOT_ACCOUNT_ID,
             conversationId,
             headers,
-            content: "Não encontrei cadastro — confirma o CPF/CNPJ?",
+            content: "Cadastro não encontrado — confirme o CPF/CNPJ.",
           });
           return;
         }
@@ -120,27 +121,47 @@ export function startServer() {
           idCliente: client.data.idCliente,
         });
 
+        // 🔴 pendência → boleto automático
         if (!acesso.ok) {
-          await sendMessage({
-            baseUrl: CHATWOOT_URL,
-            accountId: CHATWOOT_ACCOUNT_ID,
-            conversationId,
-            headers,
-            content:
-              "Identifiquei uma pendência financeira.\n" +
-              "Posso enviar o boleto agora.",
+          const debitos = await rnListDebitos({
+            baseUrl: RECEITANET_BASE_URL,
+            token: RECEITANET_TOKEN,
+            app: RECEITANET_APP,
+            cpfcnpj: doc,
           });
+
+          const boleto = pickBestOverdueBoleto(debitos);
+
+          if (boleto) {
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers,
+              content: formatBoletoWhatsApp(boleto),
+            });
+          } else {
+            await sendMessage({
+              baseUrl: CHATWOOT_URL,
+              accountId: CHATWOOT_ACCOUNT_ID,
+              conversationId,
+              headers,
+              content: "Existe pendência, mas não consegui gerar boleto automático.",
+            });
+          }
+
           return;
         }
 
+        // acesso normal
         await sendMessage({
           baseUrl: CHATWOOT_URL,
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers,
           content:
-            "Seu acesso está normal 👍\n\n" +
-            "Desligue o roteador por 30 segundos e me avise.",
+            "Seu acesso está ativo 👍\n\n" +
+            "Desligue o roteador por 30s e me avise.",
         });
 
         await setCustomAttributesMerge({
@@ -154,33 +175,9 @@ export function startServer() {
         return;
       }
 
-      // =====================================================
-      // SUPORTE — reboot
-      // =====================================================
-      if (state === "support_reboot") {
-        await sendMessage({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
-          conversationId,
-          headers,
-          content:
-            "Se ainda não voltou, vou encaminhar para o técnico 👍",
-        });
-
-        await setCustomAttributesMerge({
-          baseUrl: CHATWOOT_URL,
-          accountId: CHATWOOT_ACCOUNT_ID,
-          conversationId,
-          headers,
-          attrs: { bot_state: "support_escalated" },
-        });
-
-        return;
-      }
-
-      // =====================================================
+      // ======================================
       // TRIAGEM
-      // =====================================================
+      // ======================================
       const numeric = mapNumericChoice(text);
       const intent = detectIntent(text, numeric);
 
@@ -199,14 +196,12 @@ export function startServer() {
           conversationId,
           headers,
           content:
-            "Entendi — sem internet.\n\n" +
-            "Me envie o CPF/CNPJ para verificar seu acesso.",
+            "Sem internet — me envie CPF/CNPJ para verificar acesso.",
         });
 
         return;
       }
 
-      // fallback GPT
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
         model: OPENAI_MODEL,
@@ -221,6 +216,7 @@ export function startServer() {
         headers,
         content: reply,
       });
+
     } catch (err) {
       console.error("❌ erro:", err);
     }
