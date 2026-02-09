@@ -7,7 +7,6 @@ import {
   extractConversationId,
   extractMessageText,
   extractAttachments,
-  pickFirstAttachment,
   detectIntent,
   mapNumericChoice,
   shouldIgnoreDuplicateEvent,
@@ -18,21 +17,11 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels,
   setCustomAttributesMerge,
   buildAuthHeaders,
-  downloadAttachmentAsDataUrl,
 } from "./lib/chatwoot.js";
 
-import {
-  rnFindClient,
-  rnListDebitos,
-  rnVerificarAcesso,
-  pickBestOverdueBoleto,
-  formatBoletoWhatsApp,
-} from "./lib/receitanet.js";
-
-import { openaiAnalyzeImage, openaiChat } from "./lib/openai.js";
+import { openaiChat } from "./lib/openai.js";
 
 const PORT = process.env.PORT || 10000;
 
@@ -41,29 +30,25 @@ const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
 const CW_UID = process.env.CW_UID;
 const CW_PASSWORD = process.env.CW_PASSWORD;
 
-const RECEITANET_BASE_URL = process.env.RECEITANET_BASE_URL;
-const RECEITANET_TOKEN = process.env.RECEITANET_CHATBOT_TOKEN;
-const RECEITANET_APP = process.env.RECEITANET_APP || "chatbot";
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
-const LABEL_GPT_ON = "gpt_on";
-const LABEL_WELCOME_SENT = "gpt_welcome_sent";
-
 export function startServer() {
   const app = express();
-  app.use(express.json({ limit: "15mb" }));
+  app.use(express.json({ limit: "10mb" }));
 
   app.post("/chatwoot-webhook", async (req, res) => {
     res.send("ok");
+
     try {
       if (!isIncomingMessage(req.body)) return;
       if (shouldIgnoreDuplicateEvent(req.body)) return;
 
       const conversationId = extractConversationId(req.body);
+      if (!conversationId) return;
+
       const text = normalizeText(extractMessageText(req.body));
-      const attachments = extractAttachments(req.body);
+      if (!text) return;
 
       const auth = await chatwootSignInIfNeeded({
         baseUrl: CHATWOOT_URL,
@@ -82,11 +67,12 @@ export function startServer() {
 
       const ca = conv.custom_attributes || {};
       const state = ca.bot_state || "triage";
-      const agent = ca.bot_agent || "isa";
 
-      // =========================
-      // SUPORTE — manter estado
-      // =========================
+      console.log("🔥 fluxo", { conversationId, text, state });
+
+      // =====================================================
+      // 🟢 SUPORTE — ETAPA 1: confirmação do problema
+      // =====================================================
       if (state === "support_check") {
         const t = text.toLowerCase();
 
@@ -97,8 +83,18 @@ export function startServer() {
             conversationId,
             headers,
             content:
-              "Entendi — o problema acontece em *todos os aparelhos*.\n\n" +
-              "Vou verificar seu acesso aqui no sistema e já te retorno. ✅",
+              "Entendi — está acontecendo em *todos os aparelhos*. 👍\n\n" +
+              "Vamos fazer um teste rápido:\n" +
+              "👉 Desligue o roteador por 30 segundos e ligue novamente.\n\n" +
+              "Me avise quando terminar.",
+          });
+
+          await setCustomAttributesMerge({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers,
+            attrs: { bot_state: "support_reboot" },
           });
 
           return;
@@ -111,12 +107,14 @@ export function startServer() {
             conversationId,
             headers,
             content:
-              "Certo — apenas *um aparelho*.\n\n" +
-              "Tente desligar e ligar o Wi-Fi desse dispositivo e me diga se volta.",
+              "Perfeito — apenas um aparelho.\n\n" +
+              "Tente desligar o Wi-Fi desse dispositivo e reconectar.",
           });
+
           return;
         }
 
+        // fallback GPT técnico
         const reply = await openaiChat({
           apiKey: OPENAI_API_KEY,
           model: OPENAI_MODEL,
@@ -131,12 +129,59 @@ export function startServer() {
           headers,
           content: reply,
         });
+
         return;
       }
 
-      // =========================
-      // TRIAGEM
-      // =========================
+      // =====================================================
+      // 🟢 SUPORTE — ETAPA 2: pós reboot
+      // =====================================================
+      if (state === "support_reboot") {
+        const t = text.toLowerCase();
+
+        if (t.includes("voltou") || t.includes("ok")) {
+          await sendMessage({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers,
+            content: "Perfeito! Internet normalizada. 👍",
+          });
+
+          await setCustomAttributesMerge({
+            baseUrl: CHATWOOT_URL,
+            accountId: CHATWOOT_ACCOUNT_ID,
+            conversationId,
+            headers,
+            attrs: { bot_state: "triage" },
+          });
+
+          return;
+        }
+
+        await sendMessage({
+          baseUrl: CHATWOOT_URL,
+          accountId: CHATWOOT_ACCOUNT_ID,
+          conversationId,
+          headers,
+          content:
+            "Entendi — vou encaminhar para nosso técnico verificar a conexão. 👍",
+        });
+
+        await setCustomAttributesMerge({
+          baseUrl: CHATWOOT_URL,
+          accountId: CHATWOOT_ACCOUNT_ID,
+          conversationId,
+          headers,
+          attrs: { bot_state: "support_escalated" },
+        });
+
+        return;
+      }
+
+      // =====================================================
+      // 🔵 TRIAGEM PRINCIPAL
+      // =====================================================
       const numeric = mapNumericChoice(text);
       const intent = detectIntent(text, numeric);
 
@@ -146,7 +191,7 @@ export function startServer() {
           accountId: CHATWOOT_ACCOUNT_ID,
           conversationId,
           headers,
-          attrs: { bot_state: "support_check", bot_agent: "anderson" },
+          attrs: { bot_state: "support_check" },
         });
 
         await sendMessage({
@@ -155,24 +200,26 @@ export function startServer() {
           conversationId,
           headers,
           content:
-            "Certo! Eu sou o *Anderson*, do suporte.\n\n" +
-            "Você está *sem internet* ou está *lento/instável*?",
+            "Você está *sem internet* ou está *lento/instável*?\n\n" +
+            "Está acontecendo em *um aparelho* ou em *todos*?",
         });
+
         return;
       }
 
+      // fallback triagem
       await sendMessage({
         baseUrl: CHATWOOT_URL,
         accountId: CHATWOOT_ACCOUNT_ID,
         conversationId,
         headers,
         content:
-          "Para te direcionar certinho, me diga:\n" +
-          "*Suporte*, *Financeiro* ou *Planos*.\n\n" +
-          "Atalhos: 1=Suporte, 2=Financeiro, 3=Planos.",
+          "Posso te ajudar com:\n" +
+          "👉 Suporte\n👉 Financeiro\n👉 Planos\n\n" +
+          "Digite uma opção.",
       });
-    } catch (e) {
-      console.error("Erro:", e);
+    } catch (err) {
+      console.error("❌ erro server:", err);
     }
   });
 
