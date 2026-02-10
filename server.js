@@ -29,7 +29,7 @@ import {
   rnFindClient,
   rnListDebitos,
   rnVerificarAcesso,
-  pickBestOverdueBoleto,
+  pickBoletoOldestOverdueElseCurrent,
   rnNotificacaoPagamento,
 } from "./lib/receitanet.js";
 
@@ -472,7 +472,10 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     return { ok: true, hasOpen: false };
   }
 
-  const boleto = pickBestOverdueBoleto(debitos);
+const picked = pickBoletoOldestOverdueElseCurrent(debitos);
+const boleto = picked?.boleto || null;
+const overdueCount = Number(picked?.overdueCount || 0);
+
   if (!boleto) {
     if (!silent) {
       await cwSendMessageRetry({
@@ -550,6 +553,18 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   }
 
   await financeSendBoletoPieces({ conversationId, headers, boleto });
+
+  if (overdueCount > 1) {
+  await cwSendMessageRetry({
+    conversationId,
+    headers,
+    content:
+      "⚠️ Identifiquei *mais de 1 boleto vencido*.\n" +
+      "Para acessar todos os boletos, use o Portal do Assinante:\n" +
+      "https://i9net.centralassinante.com.br/",
+  });
+}
+
 
   await cwSendMessageRetry({
     conversationId,
@@ -1047,3 +1062,4 @@ export function startServer() {
 
   app.listen(PORT, () => console.log("🚀 Bot online na porta", PORT));
 }
+
