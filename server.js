@@ -19,12 +19,12 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels,
+  addLabels, // ✅ MERGE seguro (não apaga gpt_on)
+  addLabel,
+  removeLabel,
   setCustomAttributesMerge,
   buildAuthHeaders,
   downloadAttachmentAsDataUrl,
-  // ⚠️ se seu lib/chatwoot.js não exporta algo para "DELETE label",
-  // a gente faz o remove via fetch direto (abaixo).
 } from "./lib/chatwoot.js";
 
 import {
@@ -37,6 +37,9 @@ import {
 
 import { openaiAnalyzeImage, openaiChat } from "./lib/openai.js";
 
+// =====================
+// ENV
+// =====================
 const PORT = process.env.PORT || 10000;
 
 const CHATWOOT_URL = (process.env.CHATWOOT_URL || "").replace(/\/+$/, "");
@@ -53,10 +56,11 @@ const RECEITANET_APP = process.env.RECEITANET_APP || "chatbot";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
+// Labels
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 
-// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado) contador do menu
+// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado) contador de 3 fugas do menu
 
 // =====================
 // Helpers
@@ -82,17 +86,70 @@ function amountsClose(a, b, tol = 0.05) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function safeLabelList(conv) {
+  return (conv?.labels || []).map((x) => (typeof x === "string" ? x : x?.title)).filter(Boolean);
+}
+function extractWhatsAppFromPayload(payload) {
+  const w =
+    payload?.sender?.additional_attributes?.whatsapp ||
+    payload?.remetente?.atributos_adicionais?.whatsapp ||
+    payload?.conversation?.meta?.sender?.additional_attributes?.whatsapp ||
+    payload?.conversation?.meta?.remetente?.atributos_adicionais?.whatsapp ||
+    payload?.contact?.phone_number ||
+    null;
 
+  return normalizePhoneBR(w || "");
+}
+function extractCpfCnpjDigits(text) {
+  const d = onlyDigits(text || "");
+  if (d.length === 11 || d.length === 14) return d;
+  return null;
+}
+function isPaymentIntent(text) {
+  const t = normalizeText(text).toLowerCase();
+  return (
+    t.includes("paguei") ||
+    t.includes("pagamento") ||
+    t.includes("comprov") ||
+    t.includes("pix") ||
+    t.includes("transfer") ||
+    t.includes("depositei")
+  );
+}
+function isBoletoIntent(text) {
+  const t = normalizeText(text).toLowerCase();
+  return t.includes("boleto") || t.includes("2ª") || t.includes("2a") || t.includes("fatura") || t.includes("segunda via");
+}
+function chunkString(str, maxLen = 1200) {
+  const s = String(str || "");
+  if (!s) return [];
+  const parts = [];
+  for (let i = 0; i < s.length; i += maxLen) parts.push(s.slice(i, i + maxLen));
+  return parts;
+}
+function isSmsnetSystemMessage(text) {
+  const t = normalizeText(text).toLowerCase();
+  if (!t) return false;
+
+  if (t.includes("digite o número")) return true;
+  if (t.includes("por favor digite um número válido")) return true;
+  if (t.includes("consultar planos")) return true;
+  if (t.includes("já sou cliente")) return true;
+  if (t.includes("contatos / endereço")) return true;
+  if (t.includes("[1]") || t.includes("[2]") || t.includes("[3]")) return true;
+  if (t.startsWith("menu")) return true;
+
+  return false;
+}
 function receiptMatchesBoleto({ analysis, boleto }) {
   const boletoLine = normalizeDigits(boleto?.barras || "");
   const recLine = normalizeDigits(analysis?.barcode_or_line || "");
-
   const strong = boletoLine && recLine && boletoLine === recLine;
 
   const boletoAmount = parseMoneyToNumber(boleto?.valor);
   const paidAmount = parseMoneyToNumber(analysis?.amount);
 
-  const amountOk = amountsClose(paidAmount, boletoAmount, 0.10); // tolerância por juros/multa
+  const amountOk = amountsClose(paidAmount, boletoAmount, 0.10);
   const hasDate = Boolean(String(analysis?.date || "").trim());
   const medium = amountOk && hasDate;
 
@@ -103,14 +160,7 @@ function receiptMatchesBoleto({ analysis, boleto }) {
     strong,
     boletoAmount,
     paidAmount,
-    boletoLineLen: boletoLine.length,
-    recLineLen: recLine.length,
   };
-}
-
-function is401(err) {
-  const msg = String(err?.message || err || "");
-  return msg.includes("(401)") || msg.includes(" 401 ") || msg.includes("failed (401)") || msg.includes('status":401');
 }
 
 function assertEnv() {
@@ -130,68 +180,8 @@ function assertEnv() {
   return true;
 }
 
-function safeLabelList(conv) {
-  return (conv?.labels || []).map((x) => (typeof x === "string" ? x : x?.title)).filter(Boolean);
-}
-
-function extractWhatsAppFromPayload(payload) {
-  const w =
-    payload?.sender?.additional_attributes?.whatsapp ||
-    payload?.remetente?.atributos_adicionais?.whatsapp ||
-    payload?.conversation?.meta?.sender?.additional_attributes?.whatsapp ||
-    payload?.conversation?.meta?.remetente?.atributos_adicionais?.whatsapp ||
-    payload?.contact?.phone_number ||
-    null;
-
-  return normalizePhoneBR(w || "");
-}
-
-function extractCpfCnpjDigits(text) {
-  const d = onlyDigits(text || "");
-  if (d.length === 11 || d.length === 14) return d;
-  return null;
-}
-
-function isPaymentIntent(text) {
-  const t = normalizeText(text).toLowerCase();
-  return (
-    t.includes("paguei") ||
-    t.includes("pagamento") ||
-    t.includes("comprov") ||
-    t.includes("pix") ||
-    t.includes("transfer") ||
-    t.includes("depositei")
-  );
-}
-
-function isBoletoIntent(text) {
-  const t = normalizeText(text).toLowerCase();
-  return t.includes("boleto") || t.includes("2ª") || t.includes("2a") || t.includes("fatura") || t.includes("segunda via");
-}
-
-function chunkString(str, maxLen = 1200) {
-  const s = String(str || "");
-  if (!s) return [];
-  const parts = [];
-  for (let i = 0; i < s.length; i += maxLen) parts.push(s.slice(i, i + maxLen));
-  return parts;
-}
-
-function isSmsnetSystemMessage(text) {
-  const t = normalizeText(text).toLowerCase();
-  if (!t) return false;
-  if (t.includes("digite o número")) return true;
-  if (t.includes("por favor digite um número válido")) return true;
-  if (t.includes("consultar planos")) return true;
-  if (t.includes("já sou cliente")) return true;
-  if (t.includes("contatos / endereço")) return true;
-  if (t.includes("[1]") || t.includes("[2]") || t.includes("[3]")) return true;
-  if (t.startsWith("menu")) return true;
-  return false;
-}
-
 // =====================
-// Chatwoot wrappers (401)
+// Chatwoot auth helpers
 // =====================
 async function cwAuth({ force = false }) {
   const auth = await chatwootSignInIfNeeded({
@@ -212,8 +202,7 @@ async function cwGetConversationRetry({ conversationId, headers }) {
       headers,
     });
   } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no getConversation -> renovando token e retry");
+    console.warn("⚠️ getConversation falhou -> forçando reauth e retry", e?.message || e);
     const h2 = await cwAuth({ force: true });
     return await getConversation({
       baseUrl: CHATWOOT_URL,
@@ -234,8 +223,7 @@ async function cwSendMessageRetry({ conversationId, headers, content }) {
       content,
     });
   } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no sendMessage -> renovando token e retry");
+    console.warn("⚠️ sendMessage falhou -> forçando reauth e retry", e?.message || e);
     const h2 = await cwAuth({ force: true });
     return await sendMessage({
       baseUrl: CHATWOOT_URL,
@@ -257,8 +245,7 @@ async function cwSetAttrsRetry({ conversationId, headers, attrs }) {
       attrs,
     });
   } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no setCustomAttributes -> renovando token e retry");
+    console.warn("⚠️ setCustomAttributes falhou -> forçando reauth e retry", e?.message || e);
     const h2 = await cwAuth({ force: true });
     return await setCustomAttributesMerge({
       baseUrl: CHATWOOT_URL,
@@ -270,86 +257,62 @@ async function cwSetAttrsRetry({ conversationId, headers, attrs }) {
   }
 }
 
+async function cwAddLabelsMergeRetry({ conversationId, headers, labels }) {
+  try {
+    return await addLabels({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+      labels,
+    });
+  } catch (e) {
+    console.warn("⚠️ addLabels falhou -> forçando reauth e retry", e?.message || e);
+    const h2 = await cwAuth({ force: true });
+    return await addLabels({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+      labels,
+    });
+  }
+}
+
+async function cwRemoveLabelRetry({ conversationId, headers, label }) {
+  try {
+    return await removeLabel({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+      label,
+    });
+  } catch (e) {
+    console.warn("⚠️ removeLabel falhou -> forçando reauth e retry", e?.message || e);
+    const h2 = await cwAuth({ force: true });
+    return await removeLabel({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+      label,
+    });
+  }
+}
+
 async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
   try {
     return await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers, dataUrl });
   } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no downloadAttachment -> renovando token e retry");
+    console.warn("⚠️ downloadAttachment falhou -> forçando reauth e retry", e?.message || e);
     const h2 = await cwAuth({ force: true });
     return await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers: h2, dataUrl });
   }
 }
 
-/**
- * ⚠️ remove label (DELETE) de forma segura.
- * Muitos Chatwoot aceitam:
- * DELETE /api/v1/accounts/:account_id/conversations/:id/labels
- * body { labels: ["gpt_on"] }
- */
-async function cwRemoveLabelRetry({ conversationId, headers, label }) {
-  const url = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/labels`;
-
-  const doReq = async (h) => {
-    const res = await fetch(url, {
-      method: "DELETE",
-      headers: { ...h, "Content-Type": "application/json" },
-      body: JSON.stringify({ labels: [label] }),
-    });
-    const text = await res.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch {}
-    if (!res.ok) {
-      const msg = `Chatwoot label DELETE failed (${res.status}) ${url}: ${JSON.stringify(json || text)}`;
-      const err = new Error(msg);
-      err.status = res.status;
-      throw err;
-    }
-    return json ?? { ok: true };
-  };
-
-  try {
-    return await doReq(headers);
-  } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no removeLabel -> renovando token e retry");
-    const h2 = await cwAuth({ force: true });
-    return await doReq(h2);
-  }
-}
-
-/**
- * add labels (POST) — usamos seu addLabels (merge no body).
- * Nota: seu addLabels aparentemente faz POST com {labels:[...]}.
- */
-async function cwAddLabelsMergedRetry({ conversationId, headers, currentLabels, labelsToAdd }) {
-  const merged = Array.from(new Set([...(currentLabels || []), ...(labelsToAdd || [])]));
-  try {
-    await addLabels({
-      baseUrl: CHATWOOT_URL,
-      accountId: CHATWOOT_ACCOUNT_ID,
-      conversationId,
-      headers,
-      labels: merged,
-    });
-    return merged;
-  } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no addLabels -> renovando token e retry");
-    const h2 = await cwAuth({ force: true });
-    await addLabels({
-      baseUrl: CHATWOOT_URL,
-      accountId: CHATWOOT_ACCOUNT_ID,
-      conversationId,
-      headers: h2,
-      labels: merged,
-    });
-    return merged;
-  }
-}
-
 // =====================
-// Finance helpers (ordem copiável)
+// Finance helpers (mensagens copiáveis)
 // =====================
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
@@ -427,28 +390,10 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
           "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
       });
     }
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia", last_cpfcnpj: "" },
-    });
     return { ok: false, reason: "not_found" };
   }
 
   const idCliente = String(client?.data?.idCliente || "").trim();
-  if (!idCliente) {
-    console.log("🧾 [FIN] ERRO: rnFindClient sem idCliente. Keys:", Object.keys(client?.data || {}));
-    if (!silent) {
-      await cwSendMessageRetry({
-        conversationId,
-        headers,
-        content:
-          "Consegui localizar o cadastro, mas o sistema não retornou o identificador do cliente para liberação automática.\n" +
-          "Vou encaminhar para conferência manual rapidinho. ✅",
-      });
-    }
-    return { ok: false, reason: "missing_id_cliente" };
-  }
 
   const debitos = await rnListDebitos({
     baseUrl: RECEITANET_BASE_URL,
@@ -468,7 +413,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
           "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\nSe você já pagou, pode enviar o *comprovante* aqui que eu confirmo.",
       });
     }
-    return { ok: true, hasOpen: false };
+    return { ok: true, hasOpen: false, idCliente };
   }
 
   const { boleto, overdueCount } = pickBestOverdueBoleto(list);
@@ -481,7 +426,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
         content: "Encontrei débitos, mas não consegui montar o boleto automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
       });
     }
-    return { ok: false, reason: "no_boleto" };
+    return { ok: false, reason: "no_boleto", idCliente };
   }
 
   if (silent) return { ok: true, hasOpen: true, boleto, overdueCount, idCliente };
@@ -545,11 +490,10 @@ export function startServer() {
       const customerText = normalizeText(customerTextRaw);
       const attachments = extractAttachments(req.body);
 
-      // evitar briga com mensagens do menu SMSNET
       if (isSmsnetSystemMessage(customerText)) return;
 
       let cwHeaders = await cwAuth({ force: false });
-      let conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
+      const conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
 
       const labels = safeLabelList(conv);
       const labelSet = new Set(labels);
@@ -574,7 +518,6 @@ export function startServer() {
         gpt_on: gptOn,
       });
 
-      // salva whatsapp
       if (wa && wa !== normalizePhoneBR(ca.whatsapp_phone || "")) {
         await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { whatsapp_phone: wa } });
       }
@@ -582,40 +525,46 @@ export function startServer() {
       const lower = normalizeText(customerText).toLowerCase();
 
       // ============================
-      // COMANDOS DE TESTE (PRODUÇÃO)
+      // MODO TESTE (PRODUÇÃO)
       // ============================
       if (lower === "#gpt_on") {
-        console.log("🟢 comando #gpt_on recebido -> ativando GPT");
-        const merged = await cwAddLabelsMergedRetry({
+        console.log("🟢 comando #gpt_on -> ativando GPT");
+
+        // ✅ MERGE seguro: não apaga outras labels
+        await cwAddLabelsMergeRetry({
           conversationId,
           headers: cwHeaders,
-          currentLabels: labels,
-          labelsToAdd: [LABEL_GPT_ON],
+          labels: [LABEL_GPT_ON],
         });
 
-        // marca atributos (sem contador)
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
           attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
         });
 
-        // boas-vindas (uma vez)
-        const welcomeSent = merged.includes(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
+        const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
+
         if (!welcomeSent) {
-          await cwAddLabelsMergedRetry({
+          // ✅ MERGE seguro: não apaga gpt_on
+          await cwAddLabelsMergeRetry({
             conversationId,
             headers: cwHeaders,
-            currentLabels: merged,
-            labelsToAdd: [LABEL_WELCOME_SENT],
+            labels: [LABEL_WELCOME_SENT],
           });
-          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { welcome_sent: true } });
+
+          await cwSetAttrsRetry({
+            conversationId,
+            headers: cwHeaders,
+            attrs: { welcome_sent: true },
+          });
 
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "✅ Modo teste ativado. Vou te atender por aqui.",
           });
+
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
@@ -623,19 +572,17 @@ export function startServer() {
               "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
           });
         }
+
         return;
       }
 
       if (lower === "#gpt_off") {
-        console.log("🔴 comando #gpt_off recebido -> desativando GPT");
-        // remove label
-        try {
-          await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
-        } catch (e) {
-          console.warn("⚠️ não consegui remover label gpt_on (ok):", e?.message || e);
-        }
+        console.log("🔴 comando #gpt_off -> desativando GPT");
 
-        // limpa atributos do bot (volta para triage mas GPT OFF não responde)
+        // remove label gpt_on
+        await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
+
+        // limpa atributos do bot (volta pra triage mas GPT OFF não responde)
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
@@ -655,6 +602,7 @@ export function startServer() {
           headers: cwHeaders,
           content: "✅ Modo teste desativado. Voltando para o atendimento padrão do menu.",
         });
+
         return;
       }
 
@@ -662,27 +610,22 @@ export function startServer() {
       // CONTADOR DE 3 FUGAS (DESATIVADO / COMENTADO)
       // ============================
       /**
-       * if (!gptOn) {
-       *   // Quando GPT OFF:
-       *   // - se cliente manda 1/2/3 -> zera contador e não interfere
-       *   // - se manda texto -> incrementa contador
-       *   // - ao atingir AUTO_GPT_THRESHOLD -> ativa label gpt_on
-       * }
+       * Aqui ficaria o contador do menu:
+       * - se GPT OFF e o cliente ignorar o menu 3x => ativa GPT automaticamente.
+       * - ATENÇÃO: você pediu para NÃO usar isso em produção agora.
        */
 
       // ============================
       // GPT OFF => NÃO RESPONDE (evita dois atendentes)
       // ============================
-      if (!gptOn) {
-        return;
-      }
-
-      // ==========================================
-      // GPT ON DAQUI PRA BAIXO
-      // ==========================================
+      if (!gptOn) return;
 
       // ============================
-      // ANEXO (comprovante)
+      // GPT ON DAQUI PRA BAIXO
+      // ============================
+
+      // ============================
+      // ANEXO (imagem/pdf)
       // ============================
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
@@ -703,11 +646,25 @@ export function startServer() {
         if (dataUrl) {
           const dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
 
+          console.log("📎 anexo baixado", {
+            ok: dl.ok,
+            status: dl.status,
+            bytes: dl.bytes,
+            contentType: dl.contentType,
+          });
+
           if (dl.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
             const analysis = await openaiAnalyzeImage({
               apiKey: OPENAI_API_KEY,
               model: OPENAI_MODEL,
               imageDataUrl: dl.dataUri,
+            });
+
+            console.log("🧾 comprovante extraído (parcial)", {
+              has: !!analysis,
+              amount: analysis?.amount,
+              date: analysis?.date,
+              hasLine: !!analysis?.barcode_or_line,
             });
 
             await cwSetAttrsRetry({
@@ -724,16 +681,17 @@ export function startServer() {
                 (analysis?.summaryText || "Consegui ler o comprovante.") +
                 "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
             });
+
             return;
           }
         }
 
+        // fallback se não deu pra ler
         if (!customerText) {
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content:
-              "📎 Recebi seu arquivo. Para eu localizar e validar no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+            content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
           });
           return;
         }
@@ -742,7 +700,7 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ============================
-      // TRIAGEM (Isa)
+      // TRIAGEM (Isa) - aceita 1/2/3 ou texto
       // ============================
       const numericChoice = mapNumericChoice(customerText);
       const intent = detectIntent(customerText, numericChoice);
@@ -845,7 +803,6 @@ export function startServer() {
         const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
         const idCliente = String(client?.data?.idCliente || "").trim();
 
-        // verifica bloqueio + débitos
         let blocked = false;
         if (idCliente && wa) {
           try {
@@ -1004,15 +961,25 @@ export function startServer() {
           silent: false,
         });
 
+        // Se teve comprovante antes, tenta validar contra boleto atual
         if (lastReceipt && result?.boleto) {
           const match = receiptMatchesBoleto({ analysis: lastReceipt, boleto: result.boleto });
+
+          console.log("🧾 [FIN] match comprovante vs boleto", {
+            conversationId,
+            ok: match.ok,
+            level: match.level,
+            boletoAmount: match.boletoAmount,
+            paidAmount: match.paidAmount,
+          });
+
           if (!match.ok) {
             await cwSendMessageRetry({
               conversationId,
               headers: cwHeaders,
               content:
                 "⚠️ Pelo comprovante que você enviou, *não consegui confirmar* que o pagamento corresponde a este boleto em aberto.\n" +
-                "Pode ser que tenha sido pago um mês diferente. Se quiser, reenvie o comprovante (ou me diga o valor/data) que eu confiro certinho.",
+                "Pode ser que tenha sido pago um mês diferente. Se quiser, reenvie o comprovante (ou me diga valor/data) que eu confiro certinho.",
             });
           } else {
             const idCliente = String(result?.idCliente || "");
@@ -1044,6 +1011,7 @@ export function startServer() {
           headers: cwHeaders,
           attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
         });
+
         return;
       }
 
@@ -1055,7 +1023,7 @@ export function startServer() {
         const reply = await openaiChat({
           apiKey: OPENAI_API_KEY,
           model: OPENAI_MODEL,
-          system: persona + "\nRegras extras:\n- Não envie menu numérico.\n- Seja objetiva.\n",
+          system: persona + "\nRegras:\n- Não envie menu numérico.\n- Seja objetiva.\n",
           user: customerText,
           maxTokens: 220,
         });
@@ -1069,7 +1037,7 @@ export function startServer() {
       }
 
       // ============================
-      // FALLBACK
+      // FALLBACK (GPT controlado)
       // ============================
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
@@ -1093,5 +1061,5 @@ export function startServer() {
   app.listen(PORT, () => console.log("🚀 Bot online na porta", PORT));
 }
 
-// Se você usa `node server.js` direto (sem index.js), descomente:
+// ⚠️ Se você executa server.js direto (sem index.js), descomente:
 // startServer();
