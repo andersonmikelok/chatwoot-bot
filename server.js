@@ -63,7 +63,8 @@ const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 // ✅ CHAVE REAL (blindagem): só seu comando seta isso
 const LABEL_GPT_MANUAL = "gpt_manual_on";
 
-// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado)
+// Anti dupla resposta na triagem (cliente manda 2 msgs seguidas)
+const TRIAGE_COOLDOWN_MS = Number(process.env.TRIAGE_COOLDOWN_MS || 2500);
 
 // =====================
 // Helpers
@@ -181,6 +182,27 @@ function assertEnv() {
     return false;
   }
   return true;
+}
+
+// =====================
+// GPT classifier (só quando der dúvida)
+// =====================
+async function classifyIntentWithGPT({ apiKey, model, text }) {
+  const reply = await openaiChat({
+    apiKey,
+    model,
+    system:
+      "Você é um classificador. Dada uma mensagem de cliente de um provedor de internet, responda SOMENTE com uma destas palavras:\n" +
+      "support (sem internet, lento, instável, wi-fi, conexão)\n" +
+      "finance (boleto, pagamento, fatura, pix, comprovante, desbloqueio)\n" +
+      "sales (planos, contratar, preço, cobertura, instalação)\n\n" +
+      "Regras: responda apenas uma palavra (support/finance/sales), minúscula, sem pontuação.",
+    user: text,
+    maxTokens: 3,
+  });
+
+  const c = (reply || "").trim().toLowerCase();
+  return ["support", "finance", "sales"].includes(c) ? c : null;
 }
 
 // =====================
@@ -607,6 +629,7 @@ export function startServer() {
             last_cpfcnpj: null,
             last_receipt_json: null,
             last_receipt_ts: null,
+            last_triage_ts: null, // ✅ limpa cooldown
           },
         });
 
@@ -714,12 +737,30 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ============================
-      // TRIAGEM (Isa) - aceita 1/2/3 ou texto
+      // TRIAGEM (Isa) - texto livre + classificador GPT quando der dúvida
       // ============================
       const numericChoice = mapNumericChoice(customerText);
-      const intent = detectIntent(customerText, numericChoice);
+      let intent = detectIntent(customerText, numericChoice); // ✅ agora detectIntent deve devolver null quando não souber
 
       if (state === "triage") {
+        // Cooldown: evita responder 2x quando cliente manda duas mensagens seguidas
+        const now = Date.now();
+        const lastTriageTs = Number(ca.last_triage_ts || 0);
+        if (lastTriageTs && now - lastTriageTs < TRIAGE_COOLDOWN_MS) {
+          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { last_triage_ts: now } });
+          return;
+        }
+        await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { last_triage_ts: now } });
+
+        // Se keyword não pegou, usa GPT só para classificar
+        if (!intent) {
+          intent = await classifyIntentWithGPT({
+            apiKey: OPENAI_API_KEY,
+            model: OPENAI_MODEL,
+            text: customerText,
+          });
+        }
+
         if (intent === "support") {
           await cwSetAttrsRetry({
             conversationId,
@@ -744,7 +785,7 @@ export function startServer() {
             conversationId,
             headers: cwHeaders,
             content:
-              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Responda 1/2 ou escreva “boleto” / “paguei”)",
+              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Se preferir, pode escrever “boleto” ou “paguei”)",
           });
           return;
         }
@@ -763,10 +804,12 @@ export function startServer() {
           return;
         }
 
+        // Fallback humano (sem forçar número)
         await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
-          content: "Só para eu te direcionar certinho:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/pagamento)*\n3) *Planos/contratar*",
+          content:
+            "Entendi 😊 É sobre *sem internet/instabilidade*, *boleto/pagamento* ou *planos/contratar*?\nPode responder com palavras mesmo (ex: “sem internet”).",
         });
         return;
       }
@@ -828,7 +871,10 @@ export function startServer() {
               contato: wa,
             });
             const a = acesso?.data || {};
-            blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
+            blocked =
+              a?.bloqueado === true ||
+              a?.liberado === false ||
+              String(a?.situacao || "").toLowerCase().includes("bloque");
           } catch {}
         }
 
@@ -921,7 +967,7 @@ export function startServer() {
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content: "Me diga: você quer *1) boleto/2ª via* ou *2) validar pagamento/comprovante*?",
+            content: "Me diga: você quer *1) boleto/2ª via* ou *2) validar pagamento/comprovante*?\n(Se preferir, escreva “boleto” ou “paguei”)",
           });
           return;
         }
