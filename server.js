@@ -59,11 +59,9 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 // Labels
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
-
-// ✅ CHAVE REAL (blindagem): só seu comando seta isso
 const LABEL_GPT_MANUAL = "gpt_manual_on";
 
-// Anti dupla resposta na triagem (cliente manda 2 msgs seguidas)
+// Anti dupla resposta na triagem
 const TRIAGE_COOLDOWN_MS = Number(process.env.TRIAGE_COOLDOWN_MS || 2500);
 
 // =====================
@@ -496,6 +494,140 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 }
 
 // =====================
+// ✅ SUPORTE - fluxo executável (para rodar também após CPF)
+// =====================
+async function runSupportCheckFlow({
+  conversationId,
+  cwHeaders,
+  ca,
+  wa,
+  customerText,
+  cpfDigitsFromDoc = null,
+}) {
+  const cpfDigits = cpfDigitsFromDoc || extractCpfCnpjDigits(customerText);
+
+  let client = null;
+
+  // tenta por WhatsApp
+  if (wa) {
+    try {
+      client = await rnFindClient({
+        baseUrl: RECEITANET_BASE_URL,
+        token: RECEITANET_TOKEN,
+        app: RECEITANET_APP,
+        phone: wa,
+      });
+    } catch (e) {
+      console.warn("⚠️ rnFindClient por WA falhou", e?.message || e);
+    }
+  }
+
+  // se não achou, tenta por CPF/CNPJ
+  if ((!client || !client.found) && cpfDigits) {
+    console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
+    try {
+      client = await rnFindClient({
+        baseUrl: RECEITANET_BASE_URL,
+        token: RECEITANET_TOKEN,
+        app: RECEITANET_APP,
+        cpfcnpj: cpfDigits,
+      });
+      await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: cpfDigits } });
+    } catch (e) {
+      console.warn("⚠️ rnFindClient por CPF falhou", e?.message || e);
+    }
+  }
+
+  // se ainda não achou, pede CPF
+  if (!client?.found) {
+    await cwSetAttrsRetry({
+      conversationId,
+      headers: cwHeaders,
+      attrs: { bot_state: "support_need_doc", bot_agent: "anderson" },
+    });
+
+    await cwSendMessageRetry({
+      conversationId,
+      headers: cwHeaders,
+      content: "Para eu verificar seu *acesso* no sistema, me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
+    });
+    return;
+  }
+
+  const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
+  const idCliente = String(client?.data?.idCliente || "").trim();
+
+  // verifica bloqueio/acesso
+  let blocked = false;
+  if (idCliente && wa) {
+    try {
+      const acesso = await rnVerificarAcesso({
+        baseUrl: RECEITANET_BASE_URL,
+        token: RECEITANET_TOKEN,
+        app: RECEITANET_APP,
+        idCliente,
+        contato: wa,
+      });
+      const a = acesso?.data || {};
+      blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
+    } catch (e) {
+      console.warn("⚠️ rnVerificarAcesso falhou", e?.message || e);
+    }
+  }
+
+  // consulta débitos
+  let debitos = [];
+  try {
+    debitos = await rnListDebitos({
+      baseUrl: RECEITANET_BASE_URL,
+      token: RECEITANET_TOKEN,
+      app: RECEITANET_APP,
+      cpfcnpj: cpfUse,
+      status: 0,
+    });
+  } catch (e) {
+    console.warn("⚠️ rnListDebitos falhou", e?.message || e);
+  }
+
+  const { boleto: overdueBoleto } = pickBestOverdueBoleto(Array.isArray(debitos) ? debitos : []);
+
+  // se tiver pendência -> financeiro
+  if (blocked || overdueBoleto) {
+    await cwSetAttrsRetry({
+      conversationId,
+      headers: cwHeaders,
+      attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
+    });
+
+    await cwSendMessageRetry({
+      conversationId,
+      headers: cwHeaders,
+      content: "Entendi. Verifiquei no sistema e seu acesso está com *pendência financeira*.\nVou te enviar agora as opções pra regularizar. 👇",
+    });
+
+    await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfUse, wa, silent: false });
+    return;
+  }
+
+  // suporte normal (sem bloqueio)
+  await cwSetAttrsRetry({
+    conversationId,
+    headers: cwHeaders,
+    attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" },
+  });
+
+  await cwSendMessageRetry({
+    conversationId,
+    headers: cwHeaders,
+    content:
+      "No sistema não aparece bloqueio agora.\nVamos fazer um teste rápido:\n" +
+      "1) Desligue a ONU/roteador por *2 minutos*\n" +
+      "2) Ligue novamente\n" +
+      "3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
+  });
+}
+
+// =====================
 // Server
 // =====================
 export function startServer() {
@@ -534,9 +666,6 @@ export function startServer() {
       const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const wa = normalizePhoneBR(waPayload || "");
 
-      // ✅ BLINDAGEM:
-      // - Ignora gpt_on "automático/sujo"
-      // - Só responde quando existir gpt_manual_on
       const gptOn = labelSet.has(LABEL_GPT_MANUAL);
 
       console.log("🔥 chegando", {
@@ -643,16 +772,12 @@ export function startServer() {
         return;
       }
 
-      // ============================
-      // LIMPEZA OPCIONAL
-      // ============================
+      // limpeza opcional
       if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
       }
 
-      // ============================
-      // GPT OFF => NÃO RESPONDE
-      // ============================
+      // GPT OFF => não responde
       if (!gptOn) return;
 
       // ============================
@@ -730,14 +855,14 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ============================
-      // TRIAGEM (Isa) - texto livre + GPT só na dúvida
+      // TRIAGEM (Isa)
       // ============================
       const numericChoice = mapNumericChoice(customerText);
       let intent = detectIntent(customerText, numericChoice);
 
       if (state === "triage") {
-        // saudação -> não chama GPT
         const t = normalizeText(customerText).toLowerCase();
+
         if (
           t === "oi" ||
           t === "ola" ||
@@ -756,7 +881,6 @@ export function startServer() {
           return;
         }
 
-        // cooldown na triagem
         const now = Date.now();
         const lastTriageTs = Number(ca.last_triage_ts || 0);
         if (lastTriageTs && now - lastTriageTs < TRIAGE_COOLDOWN_MS) {
@@ -765,7 +889,6 @@ export function startServer() {
         }
         await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { last_triage_ts: now } });
 
-        // GPT só se detectIntent retornou null
         if (!intent) {
           intent = await classifyIntentWithGPT({
             apiKey: OPENAI_API_KEY,
@@ -827,114 +950,21 @@ export function startServer() {
       }
 
       // ============================
-      // SUPORTE (Anderson)
+      // ✅ SUPORTE (Anderson)
       // ============================
       if (state === "support_check") {
-        const cpfDigits = extractCpfCnpjDigits(customerText);
-
-        let client = null;
-
-        if (wa) {
-          client = await rnFindClient({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            phone: wa,
-          });
-        }
-
-        if ((!client || !client.found) && cpfDigits) {
-          console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
-          client = await rnFindClient({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            cpfcnpj: cpfDigits,
-          });
-          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: cpfDigits } });
-        }
-
-        if (!client?.found) {
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_state: "support_need_doc", bot_agent: "anderson" },
-          });
-
-          await cwSendMessageRetry({
-            conversationId,
-            headers: cwHeaders,
-            content: "Para eu verificar seu *acesso* no sistema, me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
-          });
-          return;
-        }
-
-        const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
-        const idCliente = String(client?.data?.idCliente || "").trim();
-
-        let blocked = false;
-        if (idCliente && wa) {
-          try {
-            const acesso = await rnVerificarAcesso({
-              baseUrl: RECEITANET_BASE_URL,
-              token: RECEITANET_TOKEN,
-              app: RECEITANET_APP,
-              idCliente,
-              contato: wa,
-            });
-            const a = acesso?.data || {};
-            blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
-          } catch {}
-        }
-
-        let debitos = [];
-        try {
-          debitos = await rnListDebitos({
-            baseUrl: RECEITANET_BASE_URL,
-            token: RECEITANET_TOKEN,
-            app: RECEITANET_APP,
-            cpfcnpj: cpfUse,
-            status: 0,
-          });
-        } catch {}
-
-        const { boleto: overdueBoleto } = pickBestOverdueBoleto(Array.isArray(debitos) ? debitos : []);
-
-        if (blocked || overdueBoleto) {
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
-          });
-
-          await cwSendMessageRetry({
-            conversationId,
-            headers: cwHeaders,
-            content: "Entendi. Verifiquei no sistema e seu acesso está com *pendência financeira*.\nVou te enviar agora as opções pra regularizar. 👇",
-          });
-
-          await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfUse, wa, silent: false });
-          return;
-        }
-
-        await cwSetAttrsRetry({
+        await runSupportCheckFlow({
           conversationId,
-          headers: cwHeaders,
-          attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" },
-        });
-
-        await cwSendMessageRetry({
-          conversationId,
-          headers: cwHeaders,
-          content:
-            "No sistema não aparece bloqueio agora.\nVamos fazer um teste rápido:\n" +
-            "1) Desligue a ONU/roteador por *2 minutos*\n" +
-            "2) Ligue novamente\n" +
-            "3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
+          cwHeaders,
+          ca,
+          wa,
+          customerText,
         });
         return;
       }
 
+      // ✅ AQUI ESTÁ A CORREÇÃO:
+      // quando receber CPF em support_need_doc, já roda o support_check na mesma execução.
       if (state === "support_need_doc") {
         const cpfDigits = extractCpfCnpjDigits(customerText);
         if (!cpfDigits) {
@@ -956,6 +986,16 @@ export function startServer() {
           conversationId,
           headers: cwHeaders,
           content: "Perfeito. Só um instante que vou verificar seu *acesso* no sistema. ✅",
+        });
+
+        // ✅ roda agora (sem esperar nova mensagem do cliente)
+        await runSupportCheckFlow({
+          conversationId,
+          cwHeaders,
+          ca: { ...ca, cpfcnpj: cpfDigits },
+          wa,
+          customerText,
+          cpfDigitsFromDoc: cpfDigits,
         });
         return;
       }
