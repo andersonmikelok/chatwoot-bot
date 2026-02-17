@@ -23,6 +23,8 @@ import {
   setCustomAttributesMerge,
   buildAuthHeaders,
   downloadAttachmentAsDataUrl,
+  // ⚠️ se seu lib/chatwoot.js não exporta algo para "DELETE label",
+  // a gente faz o remove via fetch direto (abaixo).
 } from "./lib/chatwoot.js";
 
 import {
@@ -54,7 +56,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 
-const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3);
+// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado) contador do menu
 
 // =====================
 // Helpers
@@ -132,32 +134,6 @@ function safeLabelList(conv) {
   return (conv?.labels || []).map((x) => (typeof x === "string" ? x : x?.title)).filter(Boolean);
 }
 
-async function addLabelsMerged({ currentLabels, labelsToAdd, cw }) {
-  const merged = Array.from(new Set([...(currentLabels || []), ...(labelsToAdd || [])]));
-  await addLabels({
-    baseUrl: cw.baseUrl,
-    accountId: cw.accountId,
-    conversationId: cw.conversationId,
-    headers: cw.headers,
-    labels: merged,
-  });
-  return merged;
-}
-
-// Menu SMSNET (só quando GPT OFF)
-function isSmsnetMenuAnswer(text) {
-  const t = (text || "").trim();
-  return t === "1" || t === "2" || t === "3";
-}
-
-// Fuga do menu (texto diferente de 1/2/3)
-function isMenuEscape(text) {
-  const t = (text || "").trim();
-  if (!t) return false;
-  if (isSmsnetMenuAnswer(t)) return false;
-  return true;
-}
-
 function extractWhatsAppFromPayload(payload) {
   const w =
     payload?.sender?.additional_attributes?.whatsapp ||
@@ -215,7 +191,7 @@ function isSmsnetSystemMessage(text) {
 }
 
 // =====================
-// Chatwoot Retry Wrappers (401)
+// Chatwoot wrappers (401)
 // =====================
 async function cwAuth({ force = false }) {
   const auth = await chatwootSignInIfNeeded({
@@ -294,25 +270,6 @@ async function cwSetAttrsRetry({ conversationId, headers, attrs }) {
   }
 }
 
-async function cwAddLabelsRetry({ conversationId, headers, currentLabels, labelsToAdd }) {
-  try {
-    return await addLabelsMerged({
-      currentLabels,
-      labelsToAdd,
-      cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers },
-    });
-  } catch (e) {
-    if (!is401(e)) throw e;
-    console.warn("🔁 401 no addLabels -> renovando token e retry");
-    const h2 = await cwAuth({ force: true });
-    return await addLabelsMerged({
-      currentLabels,
-      labelsToAdd,
-      cw: { baseUrl: CHATWOOT_URL, accountId: CHATWOOT_ACCOUNT_ID, conversationId, headers: h2 },
-    });
-  }
-}
-
 async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
   try {
     return await downloadAttachmentAsDataUrl({ baseUrl: CHATWOOT_URL, headers, dataUrl });
@@ -324,8 +281,75 @@ async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
   }
 }
 
+/**
+ * ⚠️ remove label (DELETE) de forma segura.
+ * Muitos Chatwoot aceitam:
+ * DELETE /api/v1/accounts/:account_id/conversations/:id/labels
+ * body { labels: ["gpt_on"] }
+ */
+async function cwRemoveLabelRetry({ conversationId, headers, label }) {
+  const url = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/labels`;
+
+  const doReq = async (h) => {
+    const res = await fetch(url, {
+      method: "DELETE",
+      headers: { ...h, "Content-Type": "application/json" },
+      body: JSON.stringify({ labels: [label] }),
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch {}
+    if (!res.ok) {
+      const msg = `Chatwoot label DELETE failed (${res.status}) ${url}: ${JSON.stringify(json || text)}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      throw err;
+    }
+    return json ?? { ok: true };
+  };
+
+  try {
+    return await doReq(headers);
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no removeLabel -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    return await doReq(h2);
+  }
+}
+
+/**
+ * add labels (POST) — usamos seu addLabels (merge no body).
+ * Nota: seu addLabels aparentemente faz POST com {labels:[...]}.
+ */
+async function cwAddLabelsMergedRetry({ conversationId, headers, currentLabels, labelsToAdd }) {
+  const merged = Array.from(new Set([...(currentLabels || []), ...(labelsToAdd || [])]));
+  try {
+    await addLabels({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers,
+      labels: merged,
+    });
+    return merged;
+  } catch (e) {
+    if (!is401(e)) throw e;
+    console.warn("🔁 401 no addLabels -> renovando token e retry");
+    const h2 = await cwAuth({ force: true });
+    await addLabels({
+      baseUrl: CHATWOOT_URL,
+      accountId: CHATWOOT_ACCOUNT_ID,
+      conversationId,
+      headers: h2,
+      labels: merged,
+    });
+    return merged;
+  }
+}
+
 // =====================
-// Finance helpers (ordem correta + copiável)
+// Finance helpers (ordem copiável)
 // =====================
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
@@ -413,7 +437,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 
   const idCliente = String(client?.data?.idCliente || "").trim();
   if (!idCliente) {
-    console.log("🧾 [FIN] ERRO: rnFindClient retornou sem idCliente. Keys:", Object.keys(client?.data || {}));
+    console.log("🧾 [FIN] ERRO: rnFindClient sem idCliente. Keys:", Object.keys(client?.data || {}));
     if (!silent) {
       await cwSendMessageRetry({
         conversationId,
@@ -423,15 +447,8 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
           "Vou encaminhar para conferência manual rapidinho. ✅",
       });
     }
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: { bot_state: "finance_wait_need", bot_agent: "cassia", last_cpfcnpj: cpfcnpj },
-    });
     return { ok: false, reason: "missing_id_cliente" };
   }
-
-  const contato = waNorm || "";
 
   const debitos = await rnListDebitos({
     baseUrl: RECEITANET_BASE_URL,
@@ -441,93 +458,33 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     status: 0,
   });
 
-  if (!Array.isArray(debitos) || debitos.length === 0) {
+  const list = Array.isArray(debitos) ? debitos : [];
+  if (list.length === 0) {
     if (!silent) {
       await cwSendMessageRetry({
         conversationId,
         headers,
         content:
-          "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\n" +
-          "Se você já pagou, pode me enviar o *comprovante* aqui que eu confirmo.",
+          "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\nSe você já pagou, pode enviar o *comprovante* aqui que eu confirmo.",
       });
     }
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: {
-        bot_state: "finance_wait_need",
-        bot_agent: "cassia",
-        last_cpfcnpj: cpfcnpj,
-        finance_id_cliente: idCliente,
-        finance_current_boleto: null,
-      },
-    });
     return { ok: true, hasOpen: false };
   }
 
-  const { boleto, overdueCount } = pickBestOverdueBoleto(debitos);
+  const { boleto, overdueCount } = pickBestOverdueBoleto(list);
 
   if (!boleto) {
     if (!silent) {
       await cwSendMessageRetry({
         conversationId,
         headers,
-        content:
-          "Encontrei débitos, mas não consegui montar o boleto automaticamente.\n" +
-          "Você quer *2ª via do boleto* ou quer *validar um pagamento*?",
+        content: "Encontrei débitos, mas não consegui montar o boleto automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
       });
     }
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: { bot_state: "finance_wait_need", bot_agent: "cassia", last_cpfcnpj: cpfcnpj, finance_id_cliente: idCliente },
-    });
     return { ok: false, reason: "no_boleto" };
   }
 
-  await cwSetAttrsRetry({
-    conversationId,
-    headers,
-    attrs: {
-      bot_state: "finance_wait_need",
-      bot_agent: "cassia",
-      last_cpfcnpj: cpfcnpj,
-      finance_id_cliente: idCliente,
-      finance_overdue_count: overdueCount,
-      finance_current_boleto: {
-        valor: boleto.valor,
-        vencimento: boleto.vencimento,
-        barras: boleto.barras,
-        debito_id: boleto.debito_id || "",
-      },
-    },
-  });
-
-  if (silent) return { ok: true, hasOpen: true, boleto, overdueCount };
-
-  let blocked = false;
-  try {
-    const acesso = await rnVerificarAcesso({
-      baseUrl: RECEITANET_BASE_URL,
-      token: RECEITANET_TOKEN,
-      app: RECEITANET_APP,
-      idCliente,
-      contato,
-    });
-    const a = acesso?.data || {};
-    blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
-  } catch {}
-
-  if (blocked) {
-    await cwSendMessageRetry({
-      conversationId,
-      headers,
-      content:
-        "Oi! 😊 Verifiquei aqui que existe uma pendência financeira, por isso o acesso ficou temporariamente bloqueado.\n" +
-        "Assim que o pagamento for realizado e compensado, a liberação acontece automaticamente.\n" +
-        "Já vou te enviar as opções pra regularizar.",
-    });
-  }
+  if (silent) return { ok: true, hasOpen: true, boleto, overdueCount, idCliente };
 
   await cwSendMessageRetry({
     conversationId,
@@ -548,23 +505,20 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   await cwSendMessageRetry({
     conversationId,
     headers,
-    content:
-      "👉 Se você já realizou o pagamento, pode enviar o comprovante aqui. Vou analisar a imagem ou PDF pra confirmar que é esse boleto e agilizar a liberação! ✅",
+    content: "👉 Se você já realizou o pagamento, pode enviar o comprovante aqui. Vou validar o *mês correto* e agilizar! ✅",
   });
-  await sleep(200);
 
   if (overdueCount > 1) {
+    await sleep(200);
     await cwSendMessageRetry({
       conversationId,
       headers,
       content:
-        "⚠️ Identifiquei *mais de 1 boleto vencido*.\n" +
-        "Para ver e emitir todos os boletos, acesse o Portal do Assinante:\n" +
-        "https://i9net.centralassinante.com.br/",
+        "⚠️ Identifiquei *mais de 1 boleto vencido*.\nPara ver e emitir todos os boletos, acesse o Portal do Assinante:\nhttps://i9net.centralassinante.com.br/",
     });
   }
 
-  return { ok: true, hasOpen: true, boleto, overdueCount };
+  return { ok: true, hasOpen: true, boleto, overdueCount, idCliente };
 }
 
 // =====================
@@ -591,7 +545,7 @@ export function startServer() {
       const customerText = normalizeText(customerTextRaw);
       const attachments = extractAttachments(req.body);
 
-      // evita briga com mensagens do menu do SMSNET
+      // evitar briga com mensagens do menu SMSNET
       if (isSmsnetSystemMessage(customerText)) return;
 
       let cwHeaders = await cwAuth({ force: false });
@@ -606,7 +560,6 @@ export function startServer() {
 
       const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const wa = normalizePhoneBR(waPayload || "");
-      const menuIgnoreCount = Number(ca.menu_ignore_count || 0);
 
       const gptOn = labelSet.has(LABEL_GPT_ON) || ca.gpt_on === true;
 
@@ -618,101 +571,118 @@ export function startServer() {
         agent,
         wa: wa || null,
         labels,
-        menu_ignore_count: menuIgnoreCount,
         gpt_on: gptOn,
       });
 
+      // salva whatsapp
       if (wa && wa !== normalizePhoneBR(ca.whatsapp_phone || "")) {
         await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { whatsapp_phone: wa } });
       }
 
+      const lower = normalizeText(customerText).toLowerCase();
+
       // ============================
-      // ATIVA GPT POR 3 "FUGAS" DO MENU (quando GPT OFF)
-      // - Se o cliente responder 1/2/3 (menu), zera contador e NÃO interfere.
-      // - Se responder texto (fuga), incrementa.
+      // COMANDOS DE TESTE (PRODUÇÃO)
+      // ============================
+      if (lower === "#gpt_on") {
+        console.log("🟢 comando #gpt_on recebido -> ativando GPT");
+        const merged = await cwAddLabelsMergedRetry({
+          conversationId,
+          headers: cwHeaders,
+          currentLabels: labels,
+          labelsToAdd: [LABEL_GPT_ON],
+        });
+
+        // marca atributos (sem contador)
+        await cwSetAttrsRetry({
+          conversationId,
+          headers: cwHeaders,
+          attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
+        });
+
+        // boas-vindas (uma vez)
+        const welcomeSent = merged.includes(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
+        if (!welcomeSent) {
+          await cwAddLabelsMergedRetry({
+            conversationId,
+            headers: cwHeaders,
+            currentLabels: merged,
+            labelsToAdd: [LABEL_WELCOME_SENT],
+          });
+          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { welcome_sent: true } });
+
+          await cwSendMessageRetry({
+            conversationId,
+            headers: cwHeaders,
+            content: "✅ Modo teste ativado. Vou te atender por aqui.",
+          });
+          await cwSendMessageRetry({
+            conversationId,
+            headers: cwHeaders,
+            content:
+              "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
+          });
+        }
+        return;
+      }
+
+      if (lower === "#gpt_off") {
+        console.log("🔴 comando #gpt_off recebido -> desativando GPT");
+        // remove label
+        try {
+          await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
+        } catch (e) {
+          console.warn("⚠️ não consegui remover label gpt_on (ok):", e?.message || e);
+        }
+
+        // limpa atributos do bot (volta para triage mas GPT OFF não responde)
+        await cwSetAttrsRetry({
+          conversationId,
+          headers: cwHeaders,
+          attrs: {
+            gpt_on: false,
+            bot_state: "triage",
+            bot_agent: "isa",
+            finance_need: null,
+            last_cpfcnpj: null,
+            last_receipt_json: null,
+            last_receipt_ts: null,
+          },
+        });
+
+        await cwSendMessageRetry({
+          conversationId,
+          headers: cwHeaders,
+          content: "✅ Modo teste desativado. Voltando para o atendimento padrão do menu.",
+        });
+        return;
+      }
+
+      // ============================
+      // CONTADOR DE 3 FUGAS (DESATIVADO / COMENTADO)
+      // ============================
+      /**
+       * if (!gptOn) {
+       *   // Quando GPT OFF:
+       *   // - se cliente manda 1/2/3 -> zera contador e não interfere
+       *   // - se manda texto -> incrementa contador
+       *   // - ao atingir AUTO_GPT_THRESHOLD -> ativa label gpt_on
+       * }
+       */
+
+      // ============================
+      // GPT OFF => NÃO RESPONDE (evita dois atendentes)
       // ============================
       if (!gptOn) {
-        if (isSmsnetMenuAnswer(customerText)) {
-          // respondeu o menu do SMSNET -> zera e não briga
-          if (menuIgnoreCount !== 0) {
-            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { menu_ignore_count: 0 } });
-          }
-          console.log("✅ respondeu menu SMSNET => zera contador e não interfere");
-          return;
-        }
-
-        if (isMenuEscape(customerText)) {
-          const next = menuIgnoreCount + 1;
-          console.log("🟡 ignorou menu", { conversationId, nextCount: next, limit: AUTO_GPT_THRESHOLD });
-
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { menu_ignore_count: next },
-          });
-
-          if (next < AUTO_GPT_THRESHOLD) {
-            // ainda não ativou, não responde nada (evita dois atendentes)
-            return;
-          }
-
-          console.log("⚡ GPT autoativado (limite atingido) => aplicando label gpt_on");
-          await cwAddLabelsRetry({
-            conversationId,
-            headers: cwHeaders,
-            currentLabels: labels,
-            labelsToAdd: [LABEL_GPT_ON],
-          });
-
-          // zera contador e marca estado inicial
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { menu_ignore_count: 0, bot_state: "triage", bot_agent: "isa", gpt_on: true },
-          });
-
-          // boas-vindas UMA vez
-          const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
-          if (!welcomeSent) {
-            await cwAddLabelsRetry({
-              conversationId,
-              headers: cwHeaders,
-              currentLabels: [...labels, LABEL_GPT_ON],
-              labelsToAdd: [LABEL_WELCOME_SENT],
-            });
-            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { welcome_sent: true } });
-
-            await cwSendMessageRetry({
-              conversationId,
-              headers: cwHeaders,
-              content: "✅ Entendi. Vou te atender por aqui sem precisar do menu.",
-            });
-            await cwSendMessageRetry({
-              conversationId,
-              headers: cwHeaders,
-              content:
-                "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, pode escrever: “sem internet”, “boleto”, “planos”…)",
-            });
-          }
-
-          // não processa a mesma mensagem ainda (evita duplicar pergunta)
-          return;
-        }
-
-        // se vier vazio e sem anexo, ignora
-        if (!customerText && attachments.length === 0) return;
-
-        // qualquer outra coisa com GPT OFF: não responde
         return;
       }
 
       // ==========================================
       // GPT ON DAQUI PRA BAIXO
-      // IMPORTANTE: NUNCA tratar "1/2/3" como menu SMSNET aqui.
       // ==========================================
 
       // ============================
-      // ANEXOS (comprovante)
+      // ANEXO (comprovante)
       // ============================
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
@@ -758,7 +728,6 @@ export function startServer() {
           }
         }
 
-        // fallback se não deu pra analisar
         if (!customerText) {
           await cwSendMessageRetry({
             conversationId,
@@ -770,13 +739,12 @@ export function startServer() {
         }
       }
 
-      // se não tem nada, ignora
       if (!customerText && attachments.length === 0) return;
 
       // ============================
-      // TRIAGEM (Isa) — aceita 1/2/3 ou texto
+      // TRIAGEM (Isa)
       // ============================
-      const numericChoice = mapNumericChoice(customerText); // 1/2/3 ou null
+      const numericChoice = mapNumericChoice(customerText);
       const intent = detectIntent(customerText, numericChoice);
 
       if (state === "triage") {
@@ -835,8 +803,6 @@ export function startServer() {
       // SUPORTE (Anderson)
       // ============================
       if (state === "support_check") {
-        // Se cliente respondeu "sem internet", já tentamos localizar e checar bloqueio.
-        // Primeiro tenta achar por WhatsApp, depois por CPF/CNPJ (se vier na msg).
         const cpfDigits = extractCpfCnpjDigits(customerText);
 
         let client = null;
@@ -851,19 +817,14 @@ export function startServer() {
         }
 
         if ((!client || !client.found) && cpfDigits) {
-          console.log("🧾 [SUP] buscando cliente por CPF/CNPJ", { conversationId, cpfDigitsLen: cpfDigits.length });
+          console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
           client = await rnFindClient({
             baseUrl: RECEITANET_BASE_URL,
             token: RECEITANET_TOKEN,
             app: RECEITANET_APP,
             cpfcnpj: cpfDigits,
           });
-
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { cpfcnpj: cpfDigits },
-          });
+          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: cpfDigits } });
         }
 
         if (!client?.found) {
@@ -873,12 +834,10 @@ export function startServer() {
             attrs: { bot_state: "support_need_doc", bot_agent: "anderson" },
           });
 
-          // **texto neutro** (não fala "bloqueio" aqui)
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content:
-              "Para eu verificar seu *acesso* no sistema, me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
+            content: "Para eu verificar seu *acesso* no sistema, me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
           });
           return;
         }
@@ -886,11 +845,7 @@ export function startServer() {
         const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
         const idCliente = String(client?.data?.idCliente || "").trim();
 
-        if (cpfUse) {
-          await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: cpfUse } });
-        }
-
-        // Verifica se há débitos (status=0) e se está bloqueado
+        // verifica bloqueio + débitos
         let blocked = false;
         if (idCliente && wa) {
           try {
@@ -903,9 +858,7 @@ export function startServer() {
             });
             const a = acesso?.data || {};
             blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
-          } catch (e) {
-            console.log("⚠️ [SUP] rnVerificarAcesso falhou", e?.message || e);
-          }
+          } catch {}
         }
 
         let debitos = [];
@@ -917,14 +870,11 @@ export function startServer() {
             cpfcnpj: cpfUse,
             status: 0,
           });
-        } catch (e) {
-          console.log("⚠️ [SUP] rnListDebitos falhou", e?.message || e);
-        }
+        } catch {}
 
         const { boleto: overdueBoleto } = pickBestOverdueBoleto(Array.isArray(debitos) ? debitos : []);
 
         if (blocked || overdueBoleto) {
-          // manda pro financeiro automaticamente e envia boleto completo
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
@@ -934,17 +884,13 @@ export function startServer() {
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content:
-              "Entendi. Verifiquei no sistema e seu acesso está com *pendência financeira*.\n" +
-              "Vou te enviar agora as opções pra regularizar (PIX / código de barras). 👇",
+            content: "Entendi. Verifiquei no sistema e seu acesso está com *pendência financeira*.\nVou te enviar agora as opções pra regularizar. 👇",
           });
 
-          // envia boleto pelo CPF/CNPJ (pega o melhor vencido e manda)
           await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfUse, wa, silent: false });
           return;
         }
 
-        // sem bloqueio / sem débito: troubleshooting
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
@@ -993,7 +939,6 @@ export function startServer() {
       // ============================
       if (state === "finance_wait_need") {
         const choice = mapNumericChoice(customerText);
-
         const need =
           choice === 1 || isBoletoIntent(customerText)
             ? "boleto"
@@ -1046,13 +991,11 @@ export function startServer() {
         await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
-          content: "Beleza. Vou verificar seu cadastro e já te retorno. ✅",
+          content: "Beleza. Vou verificar no sistema e já te retorno. ✅",
         });
 
-        // Se o cliente já mandou comprovante antes (last_receipt_json), validar mês/linha
         const lastReceipt = ca.last_receipt_json || null;
 
-        // Puxa boleto e envia (completo)
         const result = await financeSendBoletoByDoc({
           conversationId,
           headers: cwHeaders,
@@ -1061,7 +1004,6 @@ export function startServer() {
           silent: false,
         });
 
-        // Se existe comprovante analisado e existe boleto atual, tenta checar se pagou mês errado
         if (lastReceipt && result?.boleto) {
           const match = receiptMatchesBoleto({ analysis: lastReceipt, boleto: result.boleto });
           if (!match.ok) {
@@ -1069,12 +1011,11 @@ export function startServer() {
               conversationId,
               headers: cwHeaders,
               content:
-                "⚠️ Observação: pelo comprovante que você enviou, *não consegui confirmar* que o pagamento corresponde a este boleto em aberto.\n" +
-                "Pode ser que tenha sido pago um mês diferente. Se quiser, me envie novamente o comprovante (ou me diga a data/valor) que eu confiro certinho.",
+                "⚠️ Pelo comprovante que você enviou, *não consegui confirmar* que o pagamento corresponde a este boleto em aberto.\n" +
+                "Pode ser que tenha sido pago um mês diferente. Se quiser, reenvie o comprovante (ou me diga o valor/data) que eu confiro certinho.",
             });
           } else {
-            // Se bateu, tenta notificar pagamento/liberar em confiança
-            const idCliente = String(ca.finance_id_cliente || "");
+            const idCliente = String(result?.idCliente || "");
             if (idCliente) {
               try {
                 await rnNotificacaoPagamento({
@@ -1084,9 +1025,7 @@ export function startServer() {
                   idCliente,
                   contato: wa || "",
                 });
-              } catch (e) {
-                console.log("⚠️ [FIN] rnNotificacaoPagamento falhou", e?.message || e);
-              }
+              } catch {}
             }
 
             await cwSendMessageRetry({
@@ -1095,12 +1034,11 @@ export function startServer() {
               content:
                 "✅ Pelo comprovante, o pagamento *parece corresponder* ao boleto em aberto.\n" +
                 "Se foi *PIX*, a liberação costuma ser imediata. Se foi *código de barras*, pode levar um prazo de compensação.\n" +
-                "Se não liberar em até alguns minutos, me avise aqui.",
+                "Se não liberar em alguns minutos, me avise aqui.",
             });
           }
         }
 
-        // volta ao “need” para seguir conversa
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
@@ -1113,14 +1051,11 @@ export function startServer() {
       // VENDAS (Isa)
       // ============================
       if (state === "sales_flow") {
-        // aqui pode ser simples, ou usar GPT controlado
         const persona = buildPersonaHeader("isa");
         const reply = await openaiChat({
           apiKey: OPENAI_API_KEY,
           model: OPENAI_MODEL,
-          system:
-            persona +
-            "\nRegras extras:\n- Não envie menu numérico.\n- Seja objetiva.\n- Coletar bairro e cidade e oferecer planos.\n",
+          system: persona + "\nRegras extras:\n- Não envie menu numérico.\n- Seja objetiva.\n",
           user: customerText,
           maxTokens: 220,
         });
@@ -1134,15 +1069,13 @@ export function startServer() {
       }
 
       // ============================
-      // FALLBACK (GPT bem controlado)
+      // FALLBACK
       // ============================
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
         model: OPENAI_MODEL,
-        system:
-          persona +
-          "\nRegras:\n- Não confundir menu SMSNET com o menu do bot.\n- Se o usuário responder '1/2/3' e o estado for triage/finance_wait_need, interpretar como opção.\n- Não repetir perguntas já respondidas.\n",
+        system: persona + "\nRegras:\n- Não repetir perguntas.\n- Não confundir 1/2/3.\n",
         user: customerText,
         maxTokens: 220,
       });
@@ -1160,5 +1093,5 @@ export function startServer() {
   app.listen(PORT, () => console.log("🚀 Bot online na porta", PORT));
 }
 
-// Se você usa `node server.js` direto (sem index.js chamando startServer), descomente:
+// Se você usa `node server.js` direto (sem index.js), descomente:
 // startServer();
