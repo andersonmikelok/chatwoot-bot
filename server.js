@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels, // ✅ MERGE seguro (não apaga gpt_on)
+  addLabels, // ✅ MERGE seguro (não apaga labels existentes)
   addLabel,
   removeLabel,
   setCustomAttributesMerge,
@@ -60,7 +60,10 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 
-// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado) contador de 3 fugas do menu
+// ✅ CHAVE REAL (blindagem): só seu comando seta isso
+const LABEL_GPT_MANUAL = "gpt_manual_on";
+
+// const AUTO_GPT_THRESHOLD = Number(process.env.AUTO_GPT_THRESHOLD || 3); // 👈 (comentado)
 
 // =====================
 // Helpers
@@ -505,7 +508,10 @@ export function startServer() {
       const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const wa = normalizePhoneBR(waPayload || "");
 
-      const gptOn = labelSet.has(LABEL_GPT_ON) || ca.gpt_on === true;
+      // ✅ BLINDAGEM:
+      // - Ignora gpt_on "automático/sujo"
+      // - Só responde quando existir gpt_manual_on
+      const gptOn = labelSet.has(LABEL_GPT_MANUAL);
 
       console.log("🔥 chegando", {
         conversationId,
@@ -516,6 +522,10 @@ export function startServer() {
         wa: wa || null,
         labels,
         gpt_on: gptOn,
+        gpt_labels: {
+          has_gpt_on: labelSet.has(LABEL_GPT_ON),
+          has_gpt_manual: labelSet.has(LABEL_GPT_MANUAL),
+        },
       });
 
       if (wa && wa !== normalizePhoneBR(ca.whatsapp_phone || "")) {
@@ -525,16 +535,16 @@ export function startServer() {
       const lower = normalizeText(customerText).toLowerCase();
 
       // ============================
-      // MODO TESTE (PRODUÇÃO)
+      // COMANDO: #gpt_on
       // ============================
       if (lower === "#gpt_on") {
-        console.log("🟢 comando #gpt_on -> ativando GPT");
+        console.log("🟢 comando #gpt_on -> ativando GPT (manual)");
 
-        // ✅ MERGE seguro: não apaga outras labels
+        // ✅ adiciona a chave manual + mantém compatibilidade com gpt_on
         await cwAddLabelsMergeRetry({
           conversationId,
           headers: cwHeaders,
-          labels: [LABEL_GPT_ON],
+          labels: [LABEL_GPT_ON, LABEL_GPT_MANUAL],
         });
 
         await cwSetAttrsRetry({
@@ -543,10 +553,10 @@ export function startServer() {
           attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
         });
 
+        // Recalcula (porque labelSet local não atualiza automaticamente)
         const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
 
         if (!welcomeSent) {
-          // ✅ MERGE seguro: não apaga gpt_on
           await cwAddLabelsMergeRetry({
             conversationId,
             headers: cwHeaders,
@@ -576,13 +586,16 @@ export function startServer() {
         return;
       }
 
+      // ============================
+      // COMANDO: #gpt_off
+      // ============================
       if (lower === "#gpt_off") {
         console.log("🔴 comando #gpt_off -> desativando GPT");
 
-        // remove label gpt_on
+        // remove label gpt_on e a chave manual
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
+        await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_MANUAL });
 
-        // limpa atributos do bot (volta pra triage mas GPT OFF não responde)
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
@@ -607,13 +620,14 @@ export function startServer() {
       }
 
       // ============================
-      // CONTADOR DE 3 FUGAS (DESATIVADO / COMENTADO)
+      // LIMPEZA OPCIONAL:
+      // Se alguém adicionou gpt_on automaticamente, remove para não confundir
+      // (mantém o sistema "limpo"; não afeta quem ativou manualmente)
       // ============================
-      /**
-       * Aqui ficaria o contador do menu:
-       * - se GPT OFF e o cliente ignorar o menu 3x => ativa GPT automaticamente.
-       * - ATENÇÃO: você pediu para NÃO usar isso em produção agora.
-       */
+      if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
+        await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
+        // não dá return aqui; só limpa e continua
+      }
 
       // ============================
       // GPT OFF => NÃO RESPONDE (evita dois atendentes)
@@ -961,7 +975,6 @@ export function startServer() {
           silent: false,
         });
 
-        // Se teve comprovante antes, tenta validar contra boleto atual
         if (lastReceipt && result?.boleto) {
           const match = receiptMatchesBoleto({ analysis: lastReceipt, boleto: result.boleto });
 
