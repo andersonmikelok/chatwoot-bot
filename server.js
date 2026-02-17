@@ -63,6 +63,9 @@ const LABEL_GPT_MANUAL = "gpt_manual_on";
 
 const TRIAGE_COOLDOWN_MS = Number(process.env.TRIAGE_COOLDOWN_MS || 2500);
 
+// ✅ DEBUG TEMPORÁRIO (ative com DEBUG_DEBITOS=1)
+const DEBUG_DEBITOS = String(process.env.DEBUG_DEBITOS || "") === "1";
+
 // =====================
 // Helpers
 // =====================
@@ -200,7 +203,6 @@ function makeDedupeKey({ conversationId, payload, text, anexos, wa }) {
   const mid = getPayloadMsgId(payload);
   if (mid) return `mid:${conversationId}:${mid}`;
   const base = `${conversationId}|${wa || ""}|${text || ""}|${anexos || 0}`;
-  // hash simples
   let h = 0;
   for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0;
   return `h:${h}`;
@@ -209,11 +211,10 @@ function shouldDropAsDuplicate({ conversationId, payload, text, anexos, wa }) {
   const key = makeDedupeKey({ conversationId, payload, text, anexos, wa });
   const now = Date.now();
   const last = _dedupe.get(key) || 0;
-  const windowMs = 3500; // suficiente pra webhook duplicado
+  const windowMs = 3500;
   if (now - last < windowMs) return true;
   _dedupe.set(key, now);
 
-  // limpeza leve
   if (_dedupe.size > 5000) {
     for (const [k, ts] of _dedupe.entries()) {
       if (now - ts > 60000) _dedupe.delete(k);
@@ -293,7 +294,6 @@ function deepHasBlockToken(obj, maxDepth = 6) {
       return false;
     }
 
-    // objeto: checa chaves e valores
     for (const [k, v] of Object.entries(x)) {
       if (walk(k, depth + 1)) return true;
       if (walk(v, depth + 1)) return true;
@@ -338,8 +338,6 @@ function isBlockedFromAnyObject(obj) {
   const liberadoFalse = liberadoKnown ? !toBool(liberadoRaw) : false;
 
   const indicios = BLOCK_TOKENS.some((tok) => st.includes(tok));
-
-  // ✅ Deep scan (pega "cliente em BLOQUEIO FINANCEIRO" em qualquer campo)
   const deep = deepHasBlockToken(obj);
 
   return bloqueado || liberadoFalse || indicios || deep;
@@ -353,6 +351,28 @@ function contatoVariants(wa) {
   if (d.startsWith("55") && d.length > 11) set.add(d.slice(2));
   if (d.startsWith("55") && d.length > 11) set.add(d.slice(2).slice(-11));
   return Array.from(set).filter(Boolean);
+}
+
+// =====================
+// 🔎 DEBUG RECEITANET (TEMPORÁRIO)
+// =====================
+function debugLogDebitos(debitos, tag = "DEBUG") {
+  if (!DEBUG_DEBITOS) return;
+
+  try {
+    const list = Array.isArray(debitos) ? debitos : [];
+    console.log(`🧾 ${tag} debitosCount=${list.length}`);
+
+    if (list.length > 0) {
+      console.log(`🧾 ${tag} PRIMEIRO ITEM (resumido):`);
+      console.log(JSON.stringify(list[0], null, 2));
+    }
+
+    console.log(`🧾 ${tag} JSON COMPLETO:`);
+    console.log(JSON.stringify(list, null, 2));
+  } catch (e) {
+    console.log("⚠️ erro ao logar debitos:", e?.message || e);
+  }
 }
 
 // =====================
@@ -582,6 +602,9 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     status: 0,
   });
 
+  // ✅ DEBUG TEMP (mostra o JSON real)
+  debugLogDebitos(debitos, "FIN");
+
   const list = Array.isArray(debitos) ? debitos : [];
   if (list.length === 0) {
     if (!silent) {
@@ -596,6 +619,18 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   }
 
   const { boleto, overdueCount } = pickBestOverdueBoleto(list);
+
+  if (DEBUG_DEBITOS) {
+    console.log("🧾 FIN pickBestOverdueBoleto", {
+      overdueCount,
+      picked_vencimento: boleto?.vencimento || null,
+      picked_valor: boleto?.valor || null,
+      picked_has_link: Boolean(boleto?.link),
+      picked_has_pix: Boolean(boleto?.qrcode_pix),
+      picked_has_barras: Boolean(boleto?.barras),
+      picked_has_pdf: Boolean(boleto?.pdf),
+    });
+  }
 
   if (!boleto) {
     if (!silent) {
@@ -766,7 +801,7 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     }
   }
 
-  // 4) Débitos pendentes: se existir QUALQUER item em status=0 -> pendência
+  // 4) Débitos pendentes
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -780,6 +815,9 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     console.warn("⚠️ rnListDebitos falhou", e?.message || e);
   }
 
+  // ✅ DEBUG TEMP (mostra o JSON real)
+  debugLogDebitos(debitos, "SUP");
+
   const debitosList = Array.isArray(debitos) ? debitos : [];
   const hasPendencia = debitosList.length > 0;
 
@@ -787,7 +825,6 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
 
   const blocked = blockedByClient || blockedByAcesso || hasPendencia;
 
-  // Log útil (sem vazar dados)
   console.log("🧾 [SUP] resumo bloqueio", {
     conversationId,
     blocked,
@@ -871,7 +908,6 @@ export function startServer() {
       const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const wa = normalizePhoneBR(waPayload || "");
 
-      // ✅ DEDUPE real
       if (shouldDropAsDuplicate({ conversationId, payload: req.body, text: customerText, anexos: attachments.length, wa })) {
         console.log("🟡 duplicate drop", { conversationId, text: customerText });
         return;
