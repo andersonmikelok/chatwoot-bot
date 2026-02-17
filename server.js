@@ -185,7 +185,7 @@ function assertEnv() {
 }
 
 // =====================
-// GPT classifier (só quando der dúvida)
+// GPT classificador (só quando der dúvida na triagem)
 // ⚠️ seu wrapper exige mínimo 16 tokens
 // =====================
 async function classifyIntentWithGPT({ apiKey, model, text }) {
@@ -203,7 +203,6 @@ async function classifyIntentWithGPT({ apiKey, model, text }) {
   });
 
   const c = (reply || "").trim().toLowerCase();
-
   if (c.includes("support")) return "support";
   if (c.includes("finance")) return "finance";
   if (c.includes("sales")) return "sales";
@@ -567,7 +566,6 @@ export function startServer() {
       if (lower === "#gpt_on") {
         console.log("🟢 comando #gpt_on -> ativando GPT (manual)");
 
-        // ✅ adiciona a chave manual + mantém compatibilidade com gpt_on
         await cwAddLabelsMergeRetry({
           conversationId,
           headers: cwHeaders,
@@ -580,7 +578,6 @@ export function startServer() {
           attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
         });
 
-        // Recalcula (porque labelSet local não atualiza automaticamente)
         const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
 
         if (!welcomeSent) {
@@ -619,7 +616,6 @@ export function startServer() {
       if (lower === "#gpt_off") {
         console.log("🔴 comando #gpt_off -> desativando GPT");
 
-        // remove label gpt_on e a chave manual
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_MANUAL });
 
@@ -648,23 +644,16 @@ export function startServer() {
       }
 
       // ============================
-      // LIMPEZA OPCIONAL:
-      // Se alguém adicionou gpt_on automaticamente, remove para não confundir
-      // (mantém o sistema "limpo"; não afeta quem ativou manualmente)
+      // LIMPEZA OPCIONAL
       // ============================
       if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
-        // não dá return aqui; só limpa e continua
       }
 
       // ============================
-      // GPT OFF => NÃO RESPONDE (evita dois atendentes)
+      // GPT OFF => NÃO RESPONDE
       // ============================
       if (!gptOn) return;
-
-      // ============================
-      // GPT ON DAQUI PRA BAIXO
-      // ============================
 
       // ============================
       // ANEXO (imagem/pdf)
@@ -728,7 +717,6 @@ export function startServer() {
           }
         }
 
-        // fallback se não deu pra ler
         if (!customerText) {
           await cwSendMessageRetry({
             conversationId,
@@ -742,7 +730,7 @@ export function startServer() {
       if (!customerText && attachments.length === 0) return;
 
       // ============================
-      // TRIAGEM (Isa) - texto livre + classificador GPT quando der dúvida
+      // TRIAGEM (Isa) - texto livre + GPT só na dúvida
       // ============================
       const numericChoice = mapNumericChoice(customerText);
       let intent = detectIntent(customerText, numericChoice);
@@ -750,7 +738,16 @@ export function startServer() {
       if (state === "triage") {
         // saudação -> não chama GPT
         const t = normalizeText(customerText).toLowerCase();
-        if (t === "oi" || t === "ola" || t === "olá" || t === "bom dia" || t === "boa tarde" || t === "boa noite") {
+        if (
+          t === "oi" ||
+          t === "ola" ||
+          t === "olá" ||
+          t === "bom dia" ||
+          t === "boa tarde" ||
+          t === "boa noite" ||
+          t === "oii" ||
+          t === "oie"
+        ) {
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
@@ -759,7 +756,7 @@ export function startServer() {
           return;
         }
 
-        // cooldown: evita responder 2x quando o cliente manda 2 msgs seguidas
+        // cooldown na triagem
         const now = Date.now();
         const lastTriageTs = Number(ca.last_triage_ts || 0);
         if (lastTriageTs && now - lastTriageTs < TRIAGE_COOLDOWN_MS) {
@@ -768,6 +765,7 @@ export function startServer() {
         }
         await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { last_triage_ts: now } });
 
+        // GPT só se detectIntent retornou null
         if (!intent) {
           intent = await classifyIntentWithGPT({
             apiKey: OPENAI_API_KEY,
@@ -823,15 +821,10 @@ export function startServer() {
           conversationId,
           headers: cwHeaders,
           content:
-            "Entendi 😊 É sobre *sem internet/instabilidade*, *boleto/pagamento* ou *planos/contratar*?\nPode responder com palavras mesmo (ex: “sem internet”).",
+            "Só para eu te direcionar certinho:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
         });
         return;
       }
-
-      // ======= (restante do seu código segue igual: suporte/financeiro/vendas/fallback) =======
-      // Para manter esse arquivo completo, cole abaixo exatamente o restante que você já tinha,
-      // começando em:  // ============================  // SUPORTE (Anderson)
-      // e indo até o final.
 
       // ============================
       // SUPORTE (Anderson)
@@ -890,10 +883,7 @@ export function startServer() {
               contato: wa,
             });
             const a = acesso?.data || {};
-            blocked =
-              a?.bloqueado === true ||
-              a?.liberado === false ||
-              String(a?.situacao || "").toLowerCase().includes("bloque");
+            blocked = a?.bloqueado === true || a?.liberado === false || String(a?.situacao || "").toLowerCase().includes("bloque");
           } catch {}
         }
 
