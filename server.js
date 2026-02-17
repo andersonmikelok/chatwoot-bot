@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels, // merge seguro
+  addLabels,
   addLabel,
   removeLabel,
   setCustomAttributesMerge,
@@ -183,28 +183,67 @@ function assertEnv() {
 }
 
 // =====================
-// ✅ Bloqueio (robusto)
+// ✅ Anti-duplicação (in-memory)
 // =====================
-function normStatus(s) {
+const _dedupe = new Map();
+function getPayloadMsgId(payload) {
+  return (
+    payload?.id ||
+    payload?.message?.id ||
+    payload?.message_id ||
+    payload?.event_id ||
+    payload?.content_attributes?.message_id ||
+    null
+  );
+}
+function makeDedupeKey({ conversationId, payload, text, anexos, wa }) {
+  const mid = getPayloadMsgId(payload);
+  if (mid) return `mid:${conversationId}:${mid}`;
+  const base = `${conversationId}|${wa || ""}|${text || ""}|${anexos || 0}`;
+  // hash simples
+  let h = 0;
+  for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0;
+  return `h:${h}`;
+}
+function shouldDropAsDuplicate({ conversationId, payload, text, anexos, wa }) {
+  const key = makeDedupeKey({ conversationId, payload, text, anexos, wa });
+  const now = Date.now();
+  const last = _dedupe.get(key) || 0;
+  const windowMs = 3500; // suficiente pra webhook duplicado
+  if (now - last < windowMs) return true;
+  _dedupe.set(key, now);
+
+  // limpeza leve
+  if (_dedupe.size > 5000) {
+    for (const [k, ts] of _dedupe.entries()) {
+      if (now - ts > 60000) _dedupe.delete(k);
+    }
+  }
+  return false;
+}
+
+// =====================
+// ✅ Bloqueio ultra-robusto (deep scan)
+// =====================
+function normStr(s) {
   return String(s || "")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .trim();
 }
+
 function toBool(v) {
   if (v === true) return true;
   if (v === false) return false;
   if (v === 1 || v === 0) return v === 1;
-
-  const s = String(v ?? "").trim().toLowerCase();
+  const s = normStr(v);
   if (!s) return false;
-
   if (["1", "true", "t", "yes", "y", "sim", "s"].includes(s)) return true;
   if (["0", "false", "f", "no", "n", "nao", "não"].includes(s)) return false;
-
   return false;
 }
+
 function unwrapObj(x) {
   let d = x?.data ?? x ?? {};
   if (d && typeof d === "object") {
@@ -214,6 +253,57 @@ function unwrapObj(x) {
   }
   return d && typeof d === "object" ? d : {};
 }
+
+const BLOCK_TOKENS = [
+  "bloque",
+  "cort",
+  "susp",
+  "inadimpl",
+  "penden",
+  "inativ",
+  "cancel",
+  "restr",
+  "desativ",
+  "sem acesso",
+  "sem conexao",
+  "sem conexão",
+  "sem internet",
+];
+
+function deepHasBlockToken(obj, maxDepth = 6) {
+  const seen = new Set();
+
+  function walk(x, depth) {
+    if (depth > maxDepth) return false;
+    if (x === null || x === undefined) return false;
+
+    const t = typeof x;
+    if (t === "string" || t === "number" || t === "boolean") {
+      const s = normStr(x);
+      if (!s) return false;
+      return BLOCK_TOKENS.some((tok) => s.includes(tok));
+    }
+
+    if (t !== "object") return false;
+    if (seen.has(x)) return false;
+    seen.add(x);
+
+    if (Array.isArray(x)) {
+      for (const it of x) if (walk(it, depth + 1)) return true;
+      return false;
+    }
+
+    // objeto: checa chaves e valores
+    for (const [k, v] of Object.entries(x)) {
+      if (walk(k, depth + 1)) return true;
+      if (walk(v, depth + 1)) return true;
+    }
+    return false;
+  }
+
+  return walk(obj, 0);
+}
+
 function isBlockedFromAnyObject(obj) {
   const a = unwrapObj(obj);
 
@@ -226,9 +316,12 @@ function isBlockedFromAnyObject(obj) {
     a.situacaoAcesso ||
     a.statusAcesso ||
     a.status_acesso ||
+    a.status_text ||
+    a.mensagem ||
+    a.message ||
     "";
 
-  const st = normStatus(situacao);
+  const st = normStr(situacao);
 
   const bloqueado =
     toBool(a.bloqueado) ||
@@ -240,22 +333,18 @@ function isBlockedFromAnyObject(obj) {
     toBool(a.bloqueioFinanceiro) ||
     toBool(a.bloqueio_financeiro);
 
-  const liberadoRaw = a.liberado ?? a.released ?? a.habilitado ?? a.ativo ?? undefined;
+  const liberadoRaw = a.liberado ?? a.released ?? a.habilitado ?? a.ativo ?? a.online ?? undefined;
   const liberadoKnown = liberadoRaw !== undefined && liberadoRaw !== null && String(liberadoRaw).trim() !== "";
   const liberadoFalse = liberadoKnown ? !toBool(liberadoRaw) : false;
 
-  const indicios =
-    st.includes("bloque") ||
-    st.includes("cort") ||
-    st.includes("susp") ||
-    st.includes("inativ") ||
-    st.includes("cancel") ||
-    st.includes("restr") ||
-    st.includes("desativ") ||
-    st.includes("penden");
+  const indicios = BLOCK_TOKENS.some((tok) => st.includes(tok));
 
-  return bloqueado || liberadoFalse || indicios;
+  // ✅ Deep scan (pega "cliente em BLOQUEIO FINANCEIRO" em qualquer campo)
+  const deep = deepHasBlockToken(obj);
+
+  return bloqueado || liberadoFalse || indicios || deep;
 }
+
 function contatoVariants(wa) {
   const d = onlyDigits(wa || "");
   const set = new Set();
@@ -267,7 +356,7 @@ function contatoVariants(wa) {
 }
 
 // =====================
-// GPT classificador (só quando der dúvida na triagem)
+// GPT classificador (só quando dúvida na triagem)
 // =====================
 async function classifyIntentWithGPT({ apiKey, model, text }) {
   const reply = await openaiChat({
@@ -557,17 +646,16 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 }
 
 // =====================
-// ✅ SUPORTE (Anderson) — fluxo do jeito que você pediu
+// ✅ SUPORTE (Anderson) — prioridade correta + bloqueio confiável
 // =====================
 async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }) {
-  // 1) Se ainda não temos "support_client_found", tenta localizar pelo TELEFONE antes de pedir CPF
+  // 1) tenta localizar por telefone ANTES de pedir CPF
   let client = null;
 
   const hasClientFound = ca.support_client_found === true;
   const storedCpf = onlyDigits(String(ca.cpfcnpj || ""));
 
   if (!hasClientFound) {
-    // tenta por telefone
     if (wa) {
       try {
         client = await rnFindClient({
@@ -582,7 +670,6 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     }
 
     if (client?.found) {
-      // achou: salva estado e dá boas-vindas
       await cwSetAttrsRetry({
         conversationId,
         headers: cwHeaders,
@@ -596,12 +683,9 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
       await cwSendMessageRetry({
         conversationId,
         headers: cwHeaders,
-        content: "Perfeito ✅ *Localizei seu cadastro pelo WhatsApp.*\nVou verificar aqui o motivo de estar sem conexão.",
+        content: "Perfeito ✅ *Localizei seu cadastro pelo WhatsApp.* Vou verificar seu acesso agora. ✅",
       });
-
-      // segue para checagem completa
     } else {
-      // NÃO achou por telefone → pede CPF/CNPJ e muda estado para support_need_doc
       await cwSetAttrsRetry({
         conversationId,
         headers: cwHeaders,
@@ -617,10 +701,7 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     }
   }
 
-  // 2) Se estamos em support_need_doc, aqui NÃO entra (porque a rota já trata)
-  // 3) A partir daqui: temos cliente encontrado ou conseguimos por CPF
-
-  // Se não veio do telefone, tenta usar CPF salvo ou que o usuário mandou aqui (caso state support_check)
+  // 2) se ainda não temos client aqui, tenta por CPF (quando veio de support_need_doc)
   if (!client?.found) {
     const cpfDigits = extractCpfCnpjDigits(customerText) || storedCpf || null;
 
@@ -639,7 +720,6 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
   }
 
   if (!client?.found) {
-    // fallback: pede CPF (garantia)
     await cwSetAttrsRetry({
       conversationId,
       headers: cwHeaders,
@@ -658,12 +738,14 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
   const idCliente = String(clientData?.idCliente || ca.support_idCliente || "").trim();
   const cpfUse = onlyDigits(String(clientData?.cpfCnpj || clientData?.cpfcnpj || ca.cpfcnpj || ""));
 
-  // 4) Verifica bloqueio/pendência
+  // 3) BLOQUEIO: client + verificar-acesso + deep scan
   const blockedByClient = isBlockedFromAnyObject(clientData);
 
   let blockedByAcesso = false;
-  if (idCliente) {
-    const contatos = contatoVariants(wa || "");
+  let acessoAny = null;
+
+  if (idCliente && wa) {
+    const contatos = contatoVariants(wa);
     for (const contato of contatos) {
       try {
         const acesso = await rnVerificarAcesso({
@@ -673,20 +755,8 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
           idCliente,
           contato,
         });
-        const blocked = isBlockedFromAnyObject(acesso);
-        const a = unwrapObj(acesso);
-
-        console.log("🧾 [SUP] verificar-acesso", {
-          conversationId,
-          idCliente,
-          contato_len: String(contato).length,
-          blocked,
-          situacao: a?.situacao || a?.status || a?.estado || a?.situacaoAcesso || a?.statusAcesso || null,
-          bloqueado: a?.bloqueado ?? a?.blocked ?? a?.bloq ?? null,
-          liberado: a?.liberado ?? a?.released ?? a?.habilitado ?? a?.ativo ?? null,
-        });
-
-        if (blocked) {
+        acessoAny = acesso;
+        if (isBlockedFromAnyObject(acesso)) {
           blockedByAcesso = true;
           break;
         }
@@ -696,6 +766,7 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     }
   }
 
+  // 4) Débitos pendentes: se existir QUALQUER item em status=0 -> pendência
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -709,10 +780,26 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     console.warn("⚠️ rnListDebitos falhou", e?.message || e);
   }
 
-  const { boleto: overdueBoleto } = pickBestOverdueBoleto(Array.isArray(debitos) ? debitos : []);
-  const blocked = blockedByClient || blockedByAcesso;
+  const debitosList = Array.isArray(debitos) ? debitos : [];
+  const hasPendencia = debitosList.length > 0;
 
-  if (blocked || overdueBoleto) {
+  const { boleto: overdueBoleto } = pickBestOverdueBoleto(debitosList);
+
+  const blocked = blockedByClient || blockedByAcesso || hasPendencia;
+
+  // Log útil (sem vazar dados)
+  console.log("🧾 [SUP] resumo bloqueio", {
+    conversationId,
+    blocked,
+    blockedByClient,
+    blockedByAcesso,
+    hasPendencia,
+    debitosCount: debitosList.length,
+    hasBoleto: Boolean(overdueBoleto),
+    acessoKeys: Object.keys(unwrapObj(acessoAny) || {}).slice(0, 12),
+  });
+
+  if (blocked) {
     await cwSetAttrsRetry({
       conversationId,
       headers: cwHeaders,
@@ -722,7 +809,7 @@ async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }
     await cwSendMessageRetry({
       conversationId,
       headers: cwHeaders,
-      content: "Identifiquei aqui uma *pendência/bloqueio financeiro* no seu cadastro.\nVou te enviar agora as opções pra regularizar. 👇",
+      content: "Identifiquei aqui *bloqueio/pendência financeira* no seu cadastro.\nVou te enviar agora as opções pra regularizar. 👇",
     });
 
     await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfUse, wa, silent: false });
@@ -771,8 +858,6 @@ export function startServer() {
       const customerText = normalizeText(customerTextRaw);
       const attachments = extractAttachments(req.body);
 
-      if (isSmsnetSystemMessage(customerText)) return;
-
       let cwHeaders = await cwAuth({ force: false });
       const conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
 
@@ -786,6 +871,14 @@ export function startServer() {
       const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
       const wa = normalizePhoneBR(waPayload || "");
 
+      // ✅ DEDUPE real
+      if (shouldDropAsDuplicate({ conversationId, payload: req.body, text: customerText, anexos: attachments.length, wa })) {
+        console.log("🟡 duplicate drop", { conversationId, text: customerText });
+        return;
+      }
+
+      if (isSmsnetSystemMessage(customerText)) return;
+
       const gptOn = labelSet.has(LABEL_GPT_MANUAL);
 
       console.log("🔥 chegando", {
@@ -797,10 +890,6 @@ export function startServer() {
         wa: wa || null,
         labels,
         gpt_on: gptOn,
-        gpt_labels: {
-          has_gpt_on: labelSet.has(LABEL_GPT_ON),
-          has_gpt_manual: labelSet.has(LABEL_GPT_MANUAL),
-        },
       });
 
       if (wa && wa !== normalizePhoneBR(ca.whatsapp_phone || "")) {
@@ -810,7 +899,7 @@ export function startServer() {
       const lower = normalizeText(customerText).toLowerCase();
 
       // ============================
-      // COMANDO: #gpt_on
+      // #gpt_on
       // ============================
       if (lower === "#gpt_on") {
         await cwAddLabelsMergeRetry({
@@ -859,12 +948,11 @@ export function startServer() {
               "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
           });
         }
-
         return;
       }
 
       // ============================
-      // COMANDO: #gpt_off
+      // #gpt_off
       // ============================
       if (lower === "#gpt_off") {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
@@ -892,7 +980,6 @@ export function startServer() {
           headers: cwHeaders,
           content: "✅ Modo teste desativado. Voltando para o atendimento padrão do menu.",
         });
-
         return;
       }
 
@@ -903,7 +990,7 @@ export function startServer() {
       if (!gptOn) return;
 
       // ============================
-      // ANEXO
+      // ANEXO (financeiro)
       // ============================
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
@@ -996,13 +1083,13 @@ export function startServer() {
               support_idCliente: null,
             },
           });
+
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
             content: "Certo! Eu sou o *Anderson*, do suporte. 👍\nVou localizar seu cadastro e verificar seu acesso. ✅",
           });
 
-          // ✅ já roda o suporte: tenta por telefone (sem pedir CPF)
           await supportHandle({ conversationId, cwHeaders, ca: { ...ca, support_client_found: false }, wa, customerText });
           return;
         }
@@ -1067,7 +1154,12 @@ export function startServer() {
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
-          attrs: { cpfcnpj: cpfDigits, bot_state: "support_check", bot_agent: "anderson", support_client_found: true },
+          attrs: {
+            cpfcnpj: cpfDigits,
+            bot_state: "support_check",
+            bot_agent: "anderson",
+            support_client_found: true,
+          },
         });
 
         await cwSendMessageRetry({
@@ -1200,7 +1292,7 @@ export function startServer() {
       }
 
       // ============================
-      // VENDAS (igual ao seu)
+      // VENDAS
       // ============================
       if (state === "sales_flow") {
         const persona = buildPersonaHeader("isa");
