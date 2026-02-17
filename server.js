@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels,
+  addLabels, // merge seguro
   addLabel,
   removeLabel,
   setCustomAttributesMerge,
@@ -61,7 +61,6 @@ const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
 const LABEL_GPT_MANUAL = "gpt_manual_on";
 
-// Anti dupla resposta na triagem
 const TRIAGE_COOLDOWN_MS = Number(process.env.TRIAGE_COOLDOWN_MS || 2500);
 
 // =====================
@@ -143,6 +142,7 @@ function isSmsnetSystemMessage(text) {
 
   return false;
 }
+
 function receiptMatchesBoleto({ analysis, boleto }) {
   const boletoLine = normalizeDigits(boleto?.barras || "");
   const recLine = normalizeDigits(analysis?.barcode_or_line || "");
@@ -183,12 +183,18 @@ function assertEnv() {
 }
 
 // =====================
-// ✅ Normalização de "booleans" e payload do verificar-acesso (CORREÇÃO DO BLOQUEIO)
+// ✅ Bloqueio (robusto)
 // =====================
+function normStatus(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
 function toBool(v) {
   if (v === true) return true;
   if (v === false) return false;
-
   if (v === 1 || v === 0) return v === 1;
 
   const s = String(v ?? "").trim().toLowerCase();
@@ -199,11 +205,8 @@ function toBool(v) {
 
   return false;
 }
-
-function unwrapAcessoData(acessoResp) {
-  // rnVerificarAcesso retorna { ok, status, data: resp.json }
-  // mas a API pode retornar { data: {...} } ou até { retorno: {...} }
-  let d = acessoResp?.data ?? acessoResp ?? {};
+function unwrapObj(x) {
+  let d = x?.data ?? x ?? {};
   if (d && typeof d === "object") {
     if (d.data && typeof d.data === "object") d = d.data;
     else if (d.retorno && typeof d.retorno === "object") d = d.retorno;
@@ -211,35 +214,56 @@ function unwrapAcessoData(acessoResp) {
   }
   return d && typeof d === "object" ? d : {};
 }
+function isBlockedFromAnyObject(obj) {
+  const a = unwrapObj(obj);
 
-function isBlockedFromAcesso(acessoResp) {
-  const a = unwrapAcessoData(acessoResp);
+  const situacao =
+    a.situacao ||
+    a.status ||
+    a.estado ||
+    a.situacaoContrato ||
+    a.situacao_contrato ||
+    a.situacaoAcesso ||
+    a.statusAcesso ||
+    a.status_acesso ||
+    "";
 
-  const situacao = normalizeText(a.situacao || a.status || a.estado || a.situacaoContrato || a.situacao_contrato || "").toLowerCase();
+  const st = normStatus(situacao);
 
   const bloqueado =
     toBool(a.bloqueado) ||
     toBool(a.blocked) ||
     toBool(a.bloq) ||
     toBool(a.cortado) ||
-    toBool(a.suspenso);
+    toBool(a.suspenso) ||
+    toBool(a.bloqueio) ||
+    toBool(a.bloqueioFinanceiro) ||
+    toBool(a.bloqueio_financeiro);
 
-  // liberado pode vir "0"/"1" ou boolean
-  // Se vier informado e for "false/0", isso é forte sinal de bloqueio
-  const liberadoRaw = a.liberado ?? a.released ?? a.habilitado ?? a.habilitada ?? undefined;
+  const liberadoRaw = a.liberado ?? a.released ?? a.habilitado ?? a.ativo ?? undefined;
   const liberadoKnown = liberadoRaw !== undefined && liberadoRaw !== null && String(liberadoRaw).trim() !== "";
   const liberadoFalse = liberadoKnown ? !toBool(liberadoRaw) : false;
 
-  const situacaoIndicaBloqueio =
-    situacao.includes("bloque") ||
-    situacao.includes("cort") ||
-    situacao.includes("susp") ||
-    situacao.includes("inativ") ||
-    situacao.includes("cancel") ||
-    situacao.includes("restr") ||
-    situacao.includes("penden"); // às vezes status vem "pendente"
+  const indicios =
+    st.includes("bloque") ||
+    st.includes("cort") ||
+    st.includes("susp") ||
+    st.includes("inativ") ||
+    st.includes("cancel") ||
+    st.includes("restr") ||
+    st.includes("desativ") ||
+    st.includes("penden");
 
-  return bloqueado || liberadoFalse || situacaoIndicaBloqueio;
+  return bloqueado || liberadoFalse || indicios;
+}
+function contatoVariants(wa) {
+  const d = onlyDigits(wa || "");
+  const set = new Set();
+  if (d) set.add(d);
+  if (d.length > 11) set.add(d.slice(-11));
+  if (d.startsWith("55") && d.length > 11) set.add(d.slice(2));
+  if (d.startsWith("55") && d.length > 11) set.add(d.slice(2).slice(-11));
+  return Array.from(set).filter(Boolean);
 }
 
 // =====================
@@ -250,11 +274,9 @@ async function classifyIntentWithGPT({ apiKey, model, text }) {
     apiKey,
     model,
     system:
-      "Você é um classificador. Dada uma mensagem de cliente de um provedor de internet, responda SOMENTE com uma destas palavras:\n" +
-      "support (sem internet, lento, instável, wi-fi, conexão)\n" +
-      "finance (boleto, pagamento, fatura, pix, comprovante, desbloqueio)\n" +
-      "sales (planos, contratar, preço, cobertura, instalação)\n\n" +
-      "Regras: responda apenas uma palavra (support/finance/sales), minúscula, sem pontuação.",
+      "Você é um classificador. Responda SOMENTE com:\n" +
+      "support | finance | sales\n\n" +
+      "Regras:\n- Uma única palavra.\n- minúscula.\n- sem pontuação.",
     user: text,
     maxTokens: 16,
   });
@@ -421,35 +443,18 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
     await cwSendMessageRetry({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}` });
     await sleep(250);
   }
-
   if (barras) {
     await cwSendMessageRetry({ conversationId, headers, content: `🏷️ *Código de barras:*\n${barras}` });
     await sleep(250);
   }
-
   if (pix) {
     const parts = chunkString(pix, 1200);
-    if (parts.length === 1) {
-      await cwSendMessageRetry({ conversationId, headers, content: `📌 *PIX copia e cola:*\n${parts[0]}` });
+    for (let i = 0; i < parts.length; i++) {
+      const title = parts.length === 1 ? "📌 *PIX copia e cola:*" : `📌 *PIX copia e cola (parte ${i + 1}/${parts.length}):*`;
+      await cwSendMessageRetry({ conversationId, headers, content: `${title}\n${parts[i]}` });
       await sleep(250);
-    } else {
-      await cwSendMessageRetry({
-        conversationId,
-        headers,
-        content: `📌 *PIX copia e cola (parte 1/${parts.length}):*\n${parts[0]}`,
-      });
-      await sleep(250);
-      for (let i = 1; i < parts.length; i++) {
-        await cwSendMessageRetry({
-          conversationId,
-          headers,
-          content: `📌 *PIX copia e cola (parte ${i + 1}/${parts.length}):*\n${parts[i]}`,
-        });
-        await sleep(250);
-      }
     }
   }
-
   if (pdf) {
     await cwSendMessageRetry({ conversationId, headers, content: `📎 *PDF:*\n${pdf}` });
     await sleep(250);
@@ -472,8 +477,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
       await cwSendMessageRetry({
         conversationId,
         headers,
-        content:
-          "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
+        content: "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular* (somente números), por favor.",
       });
     }
     return { ok: false, reason: "not_found" };
@@ -509,8 +513,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
       await cwSendMessageRetry({
         conversationId,
         headers,
-        content:
-          "Encontrei débitos, mas não consegui identificar um boleto *pendente* automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
+        content: "Encontrei débitos, mas não consegui identificar um boleto *pendente* automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
       });
     }
     return { ok: false, reason: "no_boleto", idCliente };
@@ -554,103 +557,145 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 }
 
 // =====================
-// ✅ SUPORTE - fluxo executável
+// ✅ SUPORTE (Anderson) — fluxo do jeito que você pediu
 // =====================
-async function runSupportCheckFlow({
-  conversationId,
-  cwHeaders,
-  ca,
-  wa,
-  customerText,
-  cpfDigitsFromDoc = null,
-}) {
-  const cpfDigits = cpfDigitsFromDoc || extractCpfCnpjDigits(customerText);
-
+async function supportHandle({ conversationId, cwHeaders, ca, wa, customerText }) {
+  // 1) Se ainda não temos "support_client_found", tenta localizar pelo TELEFONE antes de pedir CPF
   let client = null;
 
-  // tenta por WhatsApp
-  if (wa) {
-    try {
-      client = await rnFindClient({
-        baseUrl: RECEITANET_BASE_URL,
-        token: RECEITANET_TOKEN,
-        app: RECEITANET_APP,
-        phone: wa,
+  const hasClientFound = ca.support_client_found === true;
+  const storedCpf = onlyDigits(String(ca.cpfcnpj || ""));
+
+  if (!hasClientFound) {
+    // tenta por telefone
+    if (wa) {
+      try {
+        client = await rnFindClient({
+          baseUrl: RECEITANET_BASE_URL,
+          token: RECEITANET_TOKEN,
+          app: RECEITANET_APP,
+          phone: wa,
+        });
+      } catch (e) {
+        console.warn("⚠️ rnFindClient por WA falhou", e?.message || e);
+      }
+    }
+
+    if (client?.found) {
+      // achou: salva estado e dá boas-vindas
+      await cwSetAttrsRetry({
+        conversationId,
+        headers: cwHeaders,
+        attrs: {
+          support_client_found: true,
+          support_idCliente: String(client?.data?.idCliente || "").trim(),
+          cpfcnpj: onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || "")) || null,
+        },
       });
-    } catch (e) {
-      console.warn("⚠️ rnFindClient por WA falhou", e?.message || e);
+
+      await cwSendMessageRetry({
+        conversationId,
+        headers: cwHeaders,
+        content: "Perfeito ✅ *Localizei seu cadastro pelo WhatsApp.*\nVou verificar aqui o motivo de estar sem conexão.",
+      });
+
+      // segue para checagem completa
+    } else {
+      // NÃO achou por telefone → pede CPF/CNPJ e muda estado para support_need_doc
+      await cwSetAttrsRetry({
+        conversationId,
+        headers: cwHeaders,
+        attrs: { bot_state: "support_need_doc", bot_agent: "anderson", support_client_found: false },
+      });
+
+      await cwSendMessageRetry({
+        conversationId,
+        headers: cwHeaders,
+        content: "Não consegui localizar seu cadastro pelo WhatsApp.\nMe envie o *CPF ou CNPJ do titular* (somente números), por favor.",
+      });
+      return;
     }
   }
 
-  // se não achou, tenta por CPF/CNPJ
-  if ((!client || !client.found) && cpfDigits) {
-    console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
-    try {
-      client = await rnFindClient({
-        baseUrl: RECEITANET_BASE_URL,
-        token: RECEITANET_TOKEN,
-        app: RECEITANET_APP,
-        cpfcnpj: cpfDigits,
-      });
-      await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: cpfDigits } });
-    } catch (e) {
-      console.warn("⚠️ rnFindClient por CPF falhou", e?.message || e);
-    }
-  }
+  // 2) Se estamos em support_need_doc, aqui NÃO entra (porque a rota já trata)
+  // 3) A partir daqui: temos cliente encontrado ou conseguimos por CPF
 
-  // se ainda não achou, pede CPF
+  // Se não veio do telefone, tenta usar CPF salvo ou que o usuário mandou aqui (caso state support_check)
   if (!client?.found) {
+    const cpfDigits = extractCpfCnpjDigits(customerText) || storedCpf || null;
+
+    if (cpfDigits) {
+      try {
+        client = await rnFindClient({
+          baseUrl: RECEITANET_BASE_URL,
+          token: RECEITANET_TOKEN,
+          app: RECEITANET_APP,
+          cpfcnpj: cpfDigits,
+        });
+      } catch (e) {
+        console.warn("⚠️ rnFindClient por CPF falhou", e?.message || e);
+      }
+    }
+  }
+
+  if (!client?.found) {
+    // fallback: pede CPF (garantia)
     await cwSetAttrsRetry({
       conversationId,
       headers: cwHeaders,
-      attrs: { bot_state: "support_need_doc", bot_agent: "anderson" },
+      attrs: { bot_state: "support_need_doc", bot_agent: "anderson", support_client_found: false },
     });
 
     await cwSendMessageRetry({
       conversationId,
       headers: cwHeaders,
-      content: "Para eu verificar seu *acesso* no sistema, me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
+      content: "Para eu verificar seu acesso no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
     });
     return;
   }
 
-  const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
-  const idCliente = String(client?.data?.idCliente || "").trim();
+  const clientData = client?.data || {};
+  const idCliente = String(clientData?.idCliente || ca.support_idCliente || "").trim();
+  const cpfUse = onlyDigits(String(clientData?.cpfCnpj || clientData?.cpfcnpj || ca.cpfcnpj || ""));
 
-  // ✅ verifica bloqueio/acesso (CORRIGIDO)
-  let blocked = false;
-  let acessoResp = null;
+  // 4) Verifica bloqueio/pendência
+  const blockedByClient = isBlockedFromAnyObject(clientData);
 
-  if (idCliente && wa) {
-    try {
-      acessoResp = await rnVerificarAcesso({
-        baseUrl: RECEITANET_BASE_URL,
-        token: RECEITANET_TOKEN,
-        app: RECEITANET_APP,
-        idCliente,
-        contato: wa,
-      });
+  let blockedByAcesso = false;
+  if (idCliente) {
+    const contatos = contatoVariants(wa || "");
+    for (const contato of contatos) {
+      try {
+        const acesso = await rnVerificarAcesso({
+          baseUrl: RECEITANET_BASE_URL,
+          token: RECEITANET_TOKEN,
+          app: RECEITANET_APP,
+          idCliente,
+          contato,
+        });
+        const blocked = isBlockedFromAnyObject(acesso);
+        const a = unwrapObj(acesso);
 
-      blocked = isBlockedFromAcesso(acessoResp);
+        console.log("🧾 [SUP] verificar-acesso", {
+          conversationId,
+          idCliente,
+          contato_len: String(contato).length,
+          blocked,
+          situacao: a?.situacao || a?.status || a?.estado || a?.situacaoAcesso || a?.statusAcesso || null,
+          bloqueado: a?.bloqueado ?? a?.blocked ?? a?.bloq ?? null,
+          liberado: a?.liberado ?? a?.released ?? a?.habilitado ?? a?.ativo ?? null,
+        });
 
-      // log seguro (não imprime tudo)
-      const a = unwrapAcessoData(acessoResp);
-      console.log("🧾 [SUP] verificar-acesso", {
-        conversationId,
-        idCliente,
-        blocked,
-        fields: {
-          bloqueado: a?.bloqueado,
-          liberado: a?.liberado,
-          situacao: a?.situacao || a?.status || a?.estado,
-        },
-      });
-    } catch (e) {
-      console.warn("⚠️ rnVerificarAcesso falhou", e?.message || e);
+        if (blocked) {
+          blockedByAcesso = true;
+          break;
+        }
+      } catch (e) {
+        console.warn("⚠️ rnVerificarAcesso falhou", e?.message || e);
+      }
     }
   }
 
-  // consulta débitos
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -665,8 +710,8 @@ async function runSupportCheckFlow({
   }
 
   const { boleto: overdueBoleto } = pickBestOverdueBoleto(Array.isArray(debitos) ? debitos : []);
+  const blocked = blockedByClient || blockedByAcesso;
 
-  // se tiver pendência ou bloqueio -> financeiro
   if (blocked || overdueBoleto) {
     await cwSetAttrsRetry({
       conversationId,
@@ -677,14 +722,14 @@ async function runSupportCheckFlow({
     await cwSendMessageRetry({
       conversationId,
       headers: cwHeaders,
-      content: "Entendi. Verifiquei no sistema e seu acesso está com *pendência/bloqueio*.\nVou te enviar agora as opções pra regularizar. 👇",
+      content: "Identifiquei aqui uma *pendência/bloqueio financeiro* no seu cadastro.\nVou te enviar agora as opções pra regularizar. 👇",
     });
 
     await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfUse, wa, silent: false });
     return;
   }
 
-  // suporte normal (sem bloqueio)
+  // 5) Sem bloqueio → diagnóstico
   await cwSetAttrsRetry({
     conversationId,
     headers: cwHeaders,
@@ -695,7 +740,7 @@ async function runSupportCheckFlow({
     conversationId,
     headers: cwHeaders,
     content:
-      "No sistema não aparece bloqueio agora.\nVamos fazer um teste rápido:\n" +
+      "Certo! No sistema não aparece bloqueio agora.\nVamos fazer um teste rápido:\n" +
       "1) Desligue a ONU/roteador por *2 minutos*\n" +
       "2) Ligue novamente\n" +
       "3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
@@ -777,7 +822,13 @@ export function startServer() {
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
-          attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
+          attrs: {
+            gpt_on: true,
+            bot_state: "triage",
+            bot_agent: "isa",
+            support_client_found: false,
+            support_idCliente: null,
+          },
         });
 
         const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
@@ -808,6 +859,7 @@ export function startServer() {
               "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
           });
         }
+
         return;
       }
 
@@ -830,6 +882,8 @@ export function startServer() {
             last_receipt_json: null,
             last_receipt_ts: null,
             last_triage_ts: null,
+            support_client_found: false,
+            support_idCliente: null,
           },
         });
 
@@ -915,26 +969,6 @@ export function startServer() {
       let intent = detectIntent(customerText, numericChoice);
 
       if (state === "triage") {
-        const t = normalizeText(customerText).toLowerCase();
-
-        if (
-          t === "oi" ||
-          t === "ola" ||
-          t === "olá" ||
-          t === "bom dia" ||
-          t === "boa tarde" ||
-          t === "boa noite" ||
-          t === "oii" ||
-          t === "oie"
-        ) {
-          await cwSendMessageRetry({
-            conversationId,
-            headers: cwHeaders,
-            content: "Oi! 😊 Me diga como posso ajudar: é *sem internet*, *boleto/pagamento* ou *planos*?",
-          });
-          return;
-        }
-
         const now = Date.now();
         const lastTriageTs = Number(ca.last_triage_ts || 0);
         if (lastTriageTs && now - lastTriageTs < TRIAGE_COOLDOWN_MS) {
@@ -955,13 +989,21 @@ export function startServer() {
           await cwSetAttrsRetry({
             conversationId,
             headers: cwHeaders,
-            attrs: { bot_agent: "anderson", bot_state: "support_check" },
+            attrs: {
+              bot_agent: "anderson",
+              bot_state: "support_check",
+              support_client_found: false,
+              support_idCliente: null,
+            },
           });
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content: "Certo! Eu sou o *Anderson*, do suporte. 👍\nVocê está *sem internet* agora ou está *lento/instável*?",
+            content: "Certo! Eu sou o *Anderson*, do suporte. 👍\nVou localizar seu cadastro e verificar seu acesso. ✅",
           });
+
+          // ✅ já roda o suporte: tenta por telefone (sem pedir CPF)
+          await supportHandle({ conversationId, cwHeaders, ca: { ...ca, support_client_found: false }, wa, customerText });
           return;
         }
 
@@ -975,7 +1017,7 @@ export function startServer() {
             conversationId,
             headers: cwHeaders,
             content:
-              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Se preferir, pode escrever “boleto” ou “paguei”)",
+              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Se preferir, escreva “boleto” / “paguei”)",
           });
           return;
         }
@@ -1006,14 +1048,8 @@ export function startServer() {
       // ============================
       // SUPORTE
       // ============================
-      if (state === "support_check") {
-        await runSupportCheckFlow({
-          conversationId,
-          cwHeaders,
-          ca,
-          wa,
-          customerText,
-        });
+      if (state === "support_check" || state === "support_wait_feedback") {
+        await supportHandle({ conversationId, cwHeaders, ca, wa, customerText });
         return;
       }
 
@@ -1031,28 +1067,27 @@ export function startServer() {
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
-          attrs: { cpfcnpj: cpfDigits, bot_state: "support_check", bot_agent: "anderson" },
+          attrs: { cpfcnpj: cpfDigits, bot_state: "support_check", bot_agent: "anderson", support_client_found: true },
         });
 
         await cwSendMessageRetry({
           conversationId,
           headers: cwHeaders,
-          content: "Perfeito. Só um instante que vou verificar seu *acesso* no sistema. ✅",
+          content: "Perfeito. *Localizei com seu CPF/CNPJ.* Vou verificar seu acesso agora. ✅",
         });
 
-        await runSupportCheckFlow({
+        await supportHandle({
           conversationId,
           cwHeaders,
-          ca: { ...ca, cpfcnpj: cpfDigits },
+          ca: { ...ca, cpfcnpj: cpfDigits, support_client_found: true },
           wa,
           customerText,
-          cpfDigitsFromDoc: cpfDigits,
         });
         return;
       }
 
       // ============================
-      // FINANCEIRO (mantido)
+      // FINANCEIRO (igual ao seu)
       // ============================
       if (state === "finance_wait_need") {
         const choice = mapNumericChoice(customerText);
@@ -1067,7 +1102,7 @@ export function startServer() {
           await cwSendMessageRetry({
             conversationId,
             headers: cwHeaders,
-            content: "Me diga: você quer *1) boleto/2ª via* ou *2) validar pagamento/comprovante*?\n(Se preferir, escreva “boleto” ou “paguei”)",
+            content: "Me diga: você quer *1) boleto/2ª via* ou *2) validar pagamento/comprovante*?",
           });
           return;
         }
@@ -1165,7 +1200,7 @@ export function startServer() {
       }
 
       // ============================
-      // VENDAS (mantido)
+      // VENDAS (igual ao seu)
       // ============================
       if (state === "sales_flow") {
         const persona = buildPersonaHeader("isa");
