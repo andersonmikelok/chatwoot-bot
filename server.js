@@ -571,7 +571,7 @@ async function runSupportCheck({ conversationId, headers, wa, ca, customerText, 
       token: RECEITANET_TOKEN,
       app: RECEITANET_APP,
       cpfcnpj: cpfUse,
-      status: 0,
+      status: 2,
       page: 1,
     });
   } catch {}
