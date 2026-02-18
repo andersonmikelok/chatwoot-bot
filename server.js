@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels, // ✅ MERGE seguro (não apaga labels existentes)
+  addLabels,
   addLabel,
   removeLabel,
   setCustomAttributesMerge,
@@ -57,14 +57,11 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 // ✅ Anti-ordem errada no WhatsApp:
-// garante espaçamento mínimo entre mensagens por conversa
 const MIN_SEND_INTERVAL_MS = Number(process.env.MIN_SEND_INTERVAL_MS || 900);
 
 // Labels
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
-
-// ✅ CHAVE REAL (blindagem): só seu comando seta isso
 const LABEL_GPT_MANUAL = "gpt_manual_on";
 
 // =====================
@@ -123,13 +120,7 @@ function isPaymentIntent(text) {
 }
 function isBoletoIntent(text) {
   const t = normalizeText(text).toLowerCase();
-  return (
-    t.includes("boleto") ||
-    t.includes("2ª") ||
-    t.includes("2a") ||
-    t.includes("fatura") ||
-    t.includes("segunda via")
-  );
+  return t.includes("boleto") || t.includes("2ª") || t.includes("2a") || t.includes("fatura") || t.includes("segunda via");
 }
 function chunkString(str, maxLen = 1200) {
   const s = String(str || "");
@@ -193,7 +184,6 @@ function assertEnv() {
 
 // ============================
 // ✅ SERIALIZAÇÃO + THROTTLE POR CONVERSA
-// (corrige ordem das mensagens no WhatsApp/Chatwoot)
 // ============================
 const sendQueue = new Map(); // conversationId -> Promise
 const lastSentAt = new Map(); // conversationId -> timestamp
@@ -202,7 +192,7 @@ function enqueueSend(conversationId, fn) {
   const prev = sendQueue.get(conversationId) || Promise.resolve();
 
   const next = prev
-    .catch(() => {}) // não trava a fila se um envio falhar
+    .catch(() => {})
     .then(async () => {
       const last = lastSentAt.get(conversationId) || 0;
       const now = Date.now();
@@ -254,7 +244,6 @@ async function cwGetConversationRetry({ conversationId, headers }) {
   }
 }
 
-// ✅ todo envio passa por enqueueSend (fila + throttle)
 async function cwSendMessageRetry({ conversationId, headers, content }) {
   return enqueueSend(conversationId, async () => {
     try {
@@ -358,6 +347,11 @@ async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
 // =====================
 // Finance helpers
 // =====================
+
+// ✅ NOVA ORDEM E SEPARAÇÃO (como você pediu)
+// - Cabeçalho "Código de barras:" numa mensagem, e o código em outra
+// - Bloco PIX vem DEPOIS do código de barras
+// - Cabeçalho "PIX copia e cola:" numa mensagem, e a chave em outra (ou partes)
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
   const valor = boleto?.valor;
@@ -366,6 +360,7 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
+  // 1) Card resumo
   const header = [];
   header.push("📄 *Boleto em aberto*");
   if (venc) header.push(`🗓️ *Vencimento:* ${venc}`);
@@ -374,31 +369,28 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   }
   await cwSendMessageRetry({ conversationId, headers, content: header.join("\n") });
 
+  // 2) Link (1 mensagem)
   if (link) {
     await cwSendMessageRetry({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}` });
   }
+
+  // 3) Código de barras (SEPARADO EM 2 mensagens)
   if (barras) {
-    await cwSendMessageRetry({ conversationId, headers, content: `🏷️ *Código de barras:*\n${barras}` });
+    await cwSendMessageRetry({ conversationId, headers, content: "🏷️ *Código de barras:*" });
+    await cwSendMessageRetry({ conversationId, headers, content: barras });
   }
+
+  // 4) PIX (DEPOIS do barras) — SEPARADO em título + valor (ou partes)
   if (pix) {
+    await cwSendMessageRetry({ conversationId, headers, content: "📌 *PIX copia e cola:*" });
+
     const parts = chunkString(pix, 1200);
-    if (parts.length === 1) {
-      await cwSendMessageRetry({ conversationId, headers, content: `📌 *PIX copia e cola:*\n${parts[0]}` });
-    } else {
-      await cwSendMessageRetry({
-        conversationId,
-        headers,
-        content: `📌 *PIX copia e cola (parte 1/${parts.length}):*\n${parts[0]}`,
-      });
-      for (let i = 1; i < parts.length; i++) {
-        await cwSendMessageRetry({
-          conversationId,
-          headers,
-          content: `📌 *PIX copia e cola (parte ${i + 1}/${parts.length}):*\n${parts[i]}`,
-        });
-      }
+    for (let i = 0; i < parts.length; i++) {
+      await cwSendMessageRetry({ conversationId, headers, content: parts[i] });
     }
   }
+
+  // 5) PDF (1 mensagem)
   if (pdf) {
     await cwSendMessageRetry({ conversationId, headers, content: `📎 *PDF:*\n${pdf}` });
   }
@@ -469,7 +461,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   await cwSendMessageRetry({
     conversationId,
     headers,
-    content: "Perfeito 😊 Já localizei aqui.\nVou te enviar agora as informações do boleto (link / PIX / código de barras).",
+    content: "Perfeito 😊 Já localizei aqui.\nVou te enviar agora as informações do boleto (link / código de barras / PIX).",
   });
 
   await financeSendBoletoPieces({ conversationId, headers, boleto });
@@ -499,20 +491,11 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 }
 
 // ============================
-// ✅ SUPORTE: roda checagem COMPLETA imediatamente
-// (resolve seu problema: envia “vou verificar” e depois não responde mais)
+// SUPORTE
 // ============================
-async function runSupportCheck({
-  conversationId,
-  headers,
-  wa,
-  ca,
-  customerText,
-  cpfOverride = null,
-}) {
+async function runSupportCheck({ conversationId, headers, wa, ca, customerText, cpfOverride = null }) {
   const cpfDigits = cpfOverride || extractCpfCnpjDigits(customerText);
 
-  // 1) tenta localizar pelo WhatsApp ANTES de pedir CPF (como você pediu)
   let client = null;
 
   if (wa) {
@@ -524,7 +507,6 @@ async function runSupportCheck({
     });
   }
 
-  // 2) se não achou pelo WhatsApp, tenta CPF/CNPJ (se tiver)
   if ((!client || !client.found) && cpfDigits) {
     console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
     client = await rnFindClient({
@@ -536,7 +518,6 @@ async function runSupportCheck({
     await cwSetAttrsRetry({ conversationId, headers, attrs: { cpfcnpj: cpfDigits } });
   }
 
-  // 3) se ainda não achou, pede CPF/CNPJ
   if (!client?.found) {
     await cwSetAttrsRetry({
       conversationId,
@@ -553,7 +534,6 @@ async function runSupportCheck({
     return;
   }
 
-  // 4) achou cadastro -> avisa (boa-vindas curta)
   await cwSendMessageRetry({
     conversationId,
     headers,
@@ -563,13 +543,9 @@ async function runSupportCheck({
   const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || cpfDigits || ""));
   const idCliente = String(client?.data?.idCliente || "").trim();
 
-  // 5) detectar bloqueio por duas fontes:
-  // - verificar-acesso
-  // - existência de débitos em aberto (status=0)
   let blockedByAcesso = false;
   let blockedByClient = false;
 
-  // 5.1) verificar-acesso (quando possível)
   let acessoData = null;
   if (idCliente && wa) {
     try {
@@ -588,7 +564,6 @@ async function runSupportCheck({
     } catch {}
   }
 
-  // 5.2) débitos em aberto
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -604,9 +579,7 @@ async function runSupportCheck({
   const list = Array.isArray(debitos) ? debitos : [];
   const { boleto: overdueBoleto } = pickBestOverdueBoleto(list);
 
-  // se existe boleto selecionável, consideramos pendência (muito mais confiável que só verificar-acesso)
   blockedByClient = Boolean(overdueBoleto);
-
   const blocked = blockedByAcesso || blockedByClient;
 
   console.log("🧾 [SUP] resumo bloqueio", {
@@ -620,7 +593,6 @@ async function runSupportCheck({
     acessoKeys: acessoData ? Object.keys(acessoData || {}) : [],
   });
 
-  // 6) se bloqueado/pendência -> manda boleto (vai para financeiro)
   if (blocked) {
     await cwSetAttrsRetry({
       conversationId,
@@ -639,7 +611,6 @@ async function runSupportCheck({
     return;
   }
 
-  // 7) se não bloqueado -> segue suporte normal
   await cwSetAttrsRetry({
     conversationId,
     headers,
@@ -719,9 +690,6 @@ export function startServer() {
 
       const lower = normalizeText(customerText).toLowerCase();
 
-      // ============================
-      // COMANDO: #gpt_on
-      // ============================
       if (lower === "#gpt_on") {
         await cwAddLabelsMergeRetry({
           conversationId,
@@ -767,9 +735,6 @@ export function startServer() {
         return;
       }
 
-      // ============================
-      // COMANDO: #gpt_off
-      // ============================
       if (lower === "#gpt_off") {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_MANUAL });
@@ -797,16 +762,13 @@ export function startServer() {
         return;
       }
 
-      // limpeza gpt_on sujo
       if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
       }
 
       if (!gptOn) return;
 
-      // ============================
-      // ANEXO (imagem/pdf)
-      // ============================
+      // anexos
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
         const dataUrl = att?.data_url || att?.dataUrl || null;
@@ -864,13 +826,10 @@ export function startServer() {
 
       if (!customerText && attachments.length === 0) return;
 
-      // ============================
-      // 🔀 "AUTO-CORREÇÃO" DE FLUXO:
-      // Se o usuário disser "sem internet" estando no financeiro, manda pro suporte.
-      // ============================
       const numericChoice = mapNumericChoice(customerText);
       const intent = detectIntent(customerText, numericChoice);
 
+      // auto-correção: "sem internet" preso no financeiro
       if (state === "finance_wait_need" || state === "finance_wait_doc" || state === "finance_handle") {
         if (intent === "support") {
           await cwSetAttrsRetry({
@@ -887,9 +846,6 @@ export function startServer() {
         }
       }
 
-      // ============================
-      // TRIAGEM
-      // ============================
       if (state === "triage") {
         if (intent === "support") {
           await cwSetAttrsRetry({
@@ -942,19 +898,9 @@ export function startServer() {
         return;
       }
 
-      // ============================
-      // SUPORTE (Anderson)
-      // ============================
+      // SUPORTE
       if (state === "support_check") {
-        // aqui pode ser "sem internet" OU já pode ser o CPF (se o cliente mandar direto)
-        await runSupportCheck({
-          conversationId,
-          headers: cwHeaders,
-          wa,
-          ca,
-          customerText,
-          cpfOverride: null,
-        });
+        await runSupportCheck({ conversationId, headers: cwHeaders, wa, ca, customerText, cpfOverride: null });
         return;
       }
 
@@ -969,9 +915,6 @@ export function startServer() {
           return;
         }
 
-        // ✅ AQUI É O PONTO QUE TE TRAVAVA:
-        // antes você só mudava o estado e retornava, esperando o cliente falar de novo.
-        // agora a checagem roda imediatamente.
         await cwSetAttrsRetry({
           conversationId,
           headers: cwHeaders,
@@ -989,9 +932,7 @@ export function startServer() {
         return;
       }
 
-      // ============================
-      // FINANCEIRO (Cassia)
-      // ============================
+      // FINANCEIRO
       if (state === "finance_wait_need") {
         const choice = mapNumericChoice(customerText);
         const need =
@@ -1102,9 +1043,7 @@ export function startServer() {
         return;
       }
 
-      // ============================
-      // VENDAS (Isa)
-      // ============================
+      // VENDAS
       if (state === "sales_flow") {
         const persona = buildPersonaHeader("isa");
         const reply = await openaiChat({
@@ -1123,9 +1062,7 @@ export function startServer() {
         return;
       }
 
-      // ============================
       // FALLBACK
-      // ============================
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
