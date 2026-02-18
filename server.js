@@ -738,22 +738,40 @@ async function resolveDocForReceipt({ ca, wa, analysis }) {
 }
 
 async function markNeedHuman({ conversationId, headers, reason }) {
+  // marca para humano (sua automação do Chatwoot faz o "atribuir ao agente")
   await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
+
   await cwSetAttrsRetry({
     conversationId,
     headers,
     attrs: { bot_state: "human_needed", bot_agent: "cassia", human_reason: reason || "manual_check" },
   });
 
+  // 1) mensagem neutra (IA)
+  await sendOrdered({
+    conversationId,
+    headers,
+    content: "⚠️ *Sou uma atendente virtual (IA).* Não consegui confirmar o pagamento com segurança.",
+    delayMs: 900,
+  });
+
+  // define setor sem citar pessoa (opcional, mas melhora)
+  const sector =
+    String(reason || "").includes("receipt") || String(reason || "").includes("boleto")
+      ? "Financeiro"
+      : "Atendimento";
+
+  // 2) mensagem de handoff (humano) — sem nome de agente
   await sendOrdered({
     conversationId,
     headers,
     content:
-      "⚠️ *Sou uma atendente virtual (IA).* Não consegui confirmar o pagamento com segurança.\n" +
-      "Vou *encaminhar para um atendente humano* finalizar a conferência, tudo bem?",
+      `✅ Já encaminhei para o *time humano* (${sector}) finalizar a conferência.\n` +
+      "Em instantes alguém assume por aqui. Obrigado! 🙂",
     delayMs: 1200,
   });
 }
+
 
 // =====================
 // Server
