@@ -412,11 +412,16 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   if (!client?.found) {
     if (!silent) {
       await sendOrdered({
-        conversationId,
-        headers,
-        content:
-          "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
-      });
+  conversationId,
+  headers,
+  content:
+    "Pode pagar pela opção que for mais prática pra você 🙂\n" +
+    "⚡ Pagando via *PIX*, a liberação costuma ser *imediata*.\n" +
+    "⚠️ *Não clique.*\n" +
+    "Para copiar: segure a mensagem do PIX → ⋮ → *Copiar* → cole no app do banco (Pix copia e cola).",
+});
+
+
     }
     return { ok: false, reason: "not_found" };
   }
