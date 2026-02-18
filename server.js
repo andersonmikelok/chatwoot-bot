@@ -409,26 +409,25 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     phone: waNorm || "",
   });
 
+  // ❌ Cliente não encontrado
   if (!client?.found) {
     if (!silent) {
       await sendOrdered({
-  conversationId,
-  headers,
-  content:
-    "Pode pagar pela opção que for mais prática pra você 🙂\n" +
-    "⚡ Pagando via *PIX*, a liberação costuma ser *imediata*.\n" +
-    "⚠️ *Não clique.*\n" +
-    "Para copiar: segure a mensagem do PIX → ⋮ → *Copiar* → cole no app do banco (Pix copia e cola).",
-});
-
-
+        conversationId,
+        headers,
+        content:
+          "Não consegui localizar esse CPF/CNPJ no sistema.\n" +
+          "Me envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
+      });
     }
+
     return { ok: false, reason: "not_found" };
   }
 
   const idCliente = String(client?.data?.idCliente || "").trim();
 
   // ✅ IMPORTANTE: PENDENTES primeiro (status=2), fallback para 0
+
   let debitos = [];
   try {
     debitos = await rnListDebitos({
