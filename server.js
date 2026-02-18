@@ -400,17 +400,17 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto, prefac
     await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}`, delayMs: 1300 });
   }
 
-  // 5) LINK por último (preview bagunça timeline)
-  if (link) {
-  // ✅ Mantém clicável e geralmente impede preview (que é o que “bagunça” a ordem)
-  const url = String(link).trim();
+  // 5) LINK por último (SEM preview pra não bagunçar)
+if (link) {
+  const safeLink = link.replace("https://", "https://\u200B"); // quebra preview
   await sendOrdered({
     conversationId,
     headers,
-    content: `🔗 *Link do boleto:*\n<${url}>`,
-    delayMs: 1600,
+    content: `🔗 *Link do boleto (copie e cole no navegador):*\n${safeLink}`,
+    delayMs: 1800,
   });
 }
+
 }
 
 async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, silent = false, skipPreface = false }) {
