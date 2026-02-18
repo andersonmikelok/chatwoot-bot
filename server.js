@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels, // ✅ merge seguro
+  addLabels,
   removeLabel,
   setCustomAttributesMerge,
   buildAuthHeaders,
@@ -58,15 +58,13 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 // Labels
 const LABEL_GPT_ON = "gpt_on";
 const LABEL_WELCOME_SENT = "gpt_welcome_sent";
-const LABEL_GPT_MANUAL = "gpt_manual_on"; // ✅ chave real
+const LABEL_GPT_MANUAL = "gpt_manual_on";
+const LABEL_NEED_HUMAN = "need_human";
 
 // =====================
 // Helpers
 // =====================
 function onlyDigits(s) {
-  return (s || "").toString().replace(/\D+/g, "");
-}
-function normalizeDigits(s) {
   return (s || "").toString().replace(/\D+/g, "");
 }
 function parseMoneyToNumber(v) {
@@ -105,26 +103,11 @@ function extractCpfCnpjDigits(text) {
 }
 function isPaymentIntent(text) {
   const t = normalizeText(text).toLowerCase();
-  return (
-    t.includes("paguei") ||
-    t.includes("pagamento") ||
-    t.includes("comprov") ||
-    t.includes("pix") ||
-    t.includes("transfer") ||
-    t.includes("depositei")
-  );
+  return t.includes("paguei") || t.includes("pagamento") || t.includes("comprov") || t.includes("pix") || t.includes("transfer");
 }
 function isBoletoIntent(text) {
   const t = normalizeText(text).toLowerCase();
-  return (
-    t.includes("boleto") ||
-    t.includes("2ª") ||
-    t.includes("2a") ||
-    t.includes("2 via") ||
-    t.includes("segunda via") ||
-    t.includes("fatura") ||
-    t.includes("mensalidade")
-  );
+  return t.includes("boleto") || t.includes("2ª") || t.includes("2a") || t.includes("2 via") || t.includes("segunda via") || t.includes("fatura");
 }
 function chunkString(str, maxLen = 1200) {
   const s = String(str || "");
@@ -147,12 +130,11 @@ function isSmsnetSystemMessage(text) {
 
   return false;
 }
-function isGreeting(text) {
-  const t = normalizeText(text).toLowerCase();
-  if (!t) return false;
-  const g = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "eai", "ei"];
-  return g.some((x) => t === x || t.startsWith(x + " "));
+
+function normalizeDigits(s) {
+  return (s || "").toString().replace(/\D+/g, "");
 }
+
 function receiptMatchesBoleto({ analysis, boleto }) {
   const boletoLine = normalizeDigits(boleto?.barras || "");
   const recLine = normalizeDigits(analysis?.barcode_or_line || "");
@@ -173,6 +155,12 @@ function receiptMatchesBoleto({ analysis, boleto }) {
     boletoAmount,
     paidAmount,
   };
+}
+
+function getSavedDocFromCA(ca) {
+  const d = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || ""));
+  if (d.length === 11 || d.length === 14) return d;
+  return "";
 }
 
 function assertEnv() {
@@ -324,7 +312,7 @@ async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
 }
 
 // =====================
-// ✅ FILA DE PROCESSAMENTO POR CONVERSA (evita corrida de estado)
+// ✅ FILAS (processamento e envio)
 // =====================
 const processQueues = new Map();
 
@@ -341,9 +329,6 @@ function enqueueProcess(conversationId, fn) {
   return next;
 }
 
-// =====================
-// ✅ FILA POR CONVERSA (ordem perfeita de envio)
-// =====================
 const sendQueues = new Map();
 
 function enqueueSend(conversationId, fn) {
@@ -362,42 +347,6 @@ async function sendOrdered({ conversationId, headers, content, delayMs = 1200 })
 }
 
 // =====================
-// ✅ RESOLVER DOC (CPF/CNPJ) SEM RE-PERGUNTAR
-// Prioridade: (1) salvo -> (2) comprovante -> (3) WhatsApp -> null
-// =====================
-async function resolveCpfCnpj({ ca, wa, analysis }) {
-  // 1) já salvo na conversa
-  const saved = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || ""));
-  if (saved.length === 11 || saved.length === 14) return { doc: saved, source: "saved" };
-
-  // 2) extraído do comprovante pela IA
-  const fromReceipt = onlyDigits(String(analysis?.payer_doc || ""));
-  if (fromReceipt.length === 11 || fromReceipt.length === 14) return { doc: fromReceipt, source: "receipt" };
-
-  // 3) localizar pelo WhatsApp
-  const waNorm = normalizePhoneBR(wa || "");
-  if (waNorm) {
-    try {
-      const client = await rnFindClient({
-        baseUrl: RECEITANET_BASE_URL,
-        token: RECEITANET_TOKEN,
-        app: RECEITANET_APP,
-        phone: waNorm,
-      });
-
-      if (client?.found) {
-        const doc = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ""));
-        if (doc.length === 11 || doc.length === 14) return { doc, source: "whatsapp" };
-      }
-    } catch (e) {
-      console.log("⚠️ resolveCpfCnpj via WhatsApp falhou", e?.message || e);
-    }
-  }
-
-  return { doc: null, source: "none" };
-}
-
-// =====================
 // Finance helpers (copiável + ORDEM)
 // =====================
 const INSTR_COPY_BAR = "🏷️ *Código de barras*";
@@ -411,9 +360,7 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto, prefac
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
-  if (prefaceText) {
-    await sendOrdered({ conversationId, headers, content: prefaceText, delayMs: 1500 });
-  }
+  if (prefaceText) await sendOrdered({ conversationId, headers, content: prefaceText, delayMs: 1500 });
 
   const header = [];
   header.push("📄 *Boleto em aberto*");
@@ -431,14 +378,10 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto, prefac
   if (pix) {
     await sendOrdered({ conversationId, headers, content: INSTR_COPY_PIX, delayMs: 1200 });
     const parts = chunkString(pix, 1100);
-    for (const part of parts) {
-      await sendOrdered({ conversationId, headers, content: part, delayMs: 1500 });
-    }
+    for (const part of parts) await sendOrdered({ conversationId, headers, content: part, delayMs: 1500 });
   }
 
-  if (pdf) {
-    await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}`, delayMs: 1200 });
-  }
+  if (pdf) await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}`, delayMs: 1200 });
 
   if (link) {
     const safeLink = link.replace("https://", "https://\u200B");
@@ -454,37 +397,20 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto, prefac
 async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, silent = false, skipPreface = false }) {
   const waNorm = normalizePhoneBR(wa || "");
 
-  let client;
-  try {
-    client = await rnFindClient({
-      baseUrl: RECEITANET_BASE_URL,
-      token: RECEITANET_TOKEN,
-      app: RECEITANET_APP,
-      cpfcnpj,
-      phone: waNorm || "",
-    });
-  } catch (e) {
-    console.log("❌ rnFindClient falhou", e?.message || e);
-    if (!silent) {
-      await sendOrdered({
-        conversationId,
-        headers,
-        content:
-          "⚠️ Estou com instabilidade para consultar o sistema agora.\n" +
-          "Me confirme o *CPF/CNPJ do titular* e o *mês da fatura* (ex: janeiro/2026) que eu encaminho para liberação.",
-        delayMs: 1200,
-      });
-    }
-    return { ok: false, reason: "receitanet_error" };
-  }
+  const client = await rnFindClient({
+    baseUrl: RECEITANET_BASE_URL,
+    token: RECEITANET_TOKEN,
+    app: RECEITANET_APP,
+    cpfcnpj,
+    phone: waNorm || "",
+  });
 
   if (!client?.found) {
     if (!silent) {
       await sendOrdered({
         conversationId,
         headers,
-        content:
-          "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
+        content: "Não consegui localizar esse CPF/CNPJ no sistema.\nMe envie o *CPF ou CNPJ do titular* (somente números), por favor.",
       });
     }
     return { ok: false, reason: "not_found" };
@@ -527,8 +453,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
       await sendOrdered({
         conversationId,
         headers,
-        content:
-          "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\nSe você já pagou, pode enviar o *comprovante* aqui que eu confirmo.",
+        content: "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\nSe você já pagou, envie o *comprovante* aqui que eu confirmo.",
       });
     }
     return { ok: true, hasOpen: false, idCliente };
@@ -541,8 +466,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
       await sendOrdered({
         conversationId,
         headers,
-        content:
-          "Encontrei débitos, mas não consegui montar o boleto automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
+        content: "Encontrei débitos, mas não consegui montar o boleto automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
       });
     }
     return { ok: false, reason: "no_boleto", idCliente };
@@ -550,9 +474,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 
   if (silent) return { ok: true, hasOpen: true, boleto, overdueCount, idCliente };
 
-  const preface = skipPreface
-    ? ""
-    : "Perfeito 😊 Já localizei aqui.\nVou te enviar agora as informações do boleto (código de barras / PIX / link).";
+  const preface = skipPreface ? "" : "Perfeito 😊 Já localizei aqui.\nVou te enviar agora as informações do boleto (código de barras / PIX / link).";
 
   await financeSendBoletoPieces({ conversationId, headers, boleto, prefaceText: preface });
 
@@ -574,8 +496,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     await sendOrdered({
       conversationId,
       headers,
-      content:
-        "⚠️ Identifiquei *mais de 1 boleto vencido*.\nPara ver e emitir todos os boletos, acesse o Portal do Assinante:\nhttps://i9net.centralassinante.com.br/",
+      content: "⚠️ Identifiquei *mais de 1 boleto vencido*.\nPara ver e emitir todos os boletos, acesse o Portal do Assinante:\nhttps://i9net.centralassinante.com.br/",
       delayMs: 1200,
     });
   }
@@ -590,7 +511,6 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
   const cpfDigits = extractCpfCnpjDigits(customerText);
 
   let client = null;
-  let foundBy = null;
 
   if (wa) {
     try {
@@ -600,45 +520,23 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
         app: RECEITANET_APP,
         phone: wa,
       });
-      if (client?.found) foundBy = "whatsapp";
     } catch {
       client = null;
     }
   }
 
   if ((!client || !client.found) && cpfDigits) {
-    console.log("🧾 [SUP] buscando por CPF/CNPJ", { conversationId, cpfLen: cpfDigits.length });
-    try {
-      client = await rnFindClient({
-        baseUrl: RECEITANET_BASE_URL,
-        token: RECEITANET_TOKEN,
-        app: RECEITANET_APP,
-        cpfcnpj: cpfDigits,
-      });
-      if (client?.found) foundBy = "doc";
-    } catch (e) {
-      console.log("❌ rnFindClient (doc) falhou", e?.message || e);
-      await sendOrdered({
-        conversationId,
-        headers,
-        content:
-          "⚠️ Estou com instabilidade para consultar o sistema agora.\n" +
-          "Me confirme seu CPF/CNPJ e descreva o problema que eu encaminho ao suporte.",
-        delayMs: 1200,
-      });
-      return;
-    }
-
+    client = await rnFindClient({
+      baseUrl: RECEITANET_BASE_URL,
+      token: RECEITANET_TOKEN,
+      app: RECEITANET_APP,
+      cpfcnpj: cpfDigits,
+    });
     await cwSetAttrsRetry({ conversationId, headers, attrs: { cpfcnpj: cpfDigits, last_cpfcnpj: cpfDigits } });
   }
 
   if (!client?.found) {
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: { bot_state: "support_need_doc", bot_agent: "anderson" },
-    });
-
+    await cwSetAttrsRetry({ conversationId, headers, attrs: { bot_state: "support_need_doc", bot_agent: "anderson" } });
     await sendOrdered({
       conversationId,
       headers,
@@ -648,37 +546,17 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     return;
   }
 
-  // ✅ persistir doc encontrado pelo WhatsApp também (pra não pedir depois)
-  const docFound = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ""));
-  if (docFound.length === 11 || docFound.length === 14) {
-    await cwSetAttrsRetry({
-      conversationId,
-      headers,
-      attrs: { cpfcnpj: docFound, last_cpfcnpj: docFound },
-    });
-  }
-
-  if (foundBy === "whatsapp") {
-    await sendOrdered({
-      conversationId,
-      headers,
-      content: "✅ Localizei seu cadastro pelo WhatsApp. Vou verificar seu acesso agora. ✅",
-      delayMs: 1200,
-    });
-  } else {
-    await sendOrdered({
-      conversationId,
-      headers,
-      content: "Perfeito. Localizei seu cadastro. Vou verificar seu acesso agora. ✅",
-      delayMs: 1200,
-    });
-  }
+  await sendOrdered({
+    conversationId,
+    headers,
+    content: "Perfeito. Localizei seu cadastro. Vou verificar seu acesso agora. ✅",
+    delayMs: 1200,
+  });
 
   const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
   const idCliente = String(client?.data?.idCliente || "").trim();
 
   let blockedByAcesso = false;
-  let acessoKeys = [];
   if (idCliente && wa) {
     try {
       const acesso = await rnVerificarAcesso({
@@ -689,7 +567,6 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
         contato: wa,
       });
       const a = acesso?.data || {};
-      acessoKeys = Object.keys(a || {});
       blockedByAcesso =
         a?.bloqueado === true ||
         a?.liberado === false ||
@@ -729,25 +606,14 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
 
   const list = Array.isArray(debitos) ? debitos : [];
   const { boleto: overdueBoleto } = pickBestOverdueBoleto(list);
-
   const hasPendencia = Boolean(overdueBoleto);
   const blocked = blockedByAcesso || hasPendencia;
-
-  console.log("🧾 [SUP] resumo bloqueio", {
-    conversationId,
-    blocked,
-    blockedByAcesso,
-    hasPendencia,
-    debitosCount: list.length,
-    hasBoleto: !!overdueBoleto,
-    acessoKeys,
-  });
 
   if (blocked) {
     await cwSetAttrsRetry({
       conversationId,
       headers,
-      attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
+      attrs: { bot_agent: "cassia", bot_state: "finance_wait_need", cpfcnpj: cpfUse, last_cpfcnpj: cpfUse },
     });
 
     await sendOrdered({
@@ -761,11 +627,7 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     return;
   }
 
-  await cwSetAttrsRetry({
-    conversationId,
-    headers,
-    attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" },
-  });
+  await cwSetAttrsRetry({ conversationId, headers, attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" } });
 
   await sendOrdered({
     conversationId,
@@ -775,6 +637,55 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
       "1) Desligue a ONU/roteador por *2 minutos*\n" +
       "2) Ligue novamente\n" +
       "3) Aguarde *2 minutos*\n\nDepois me diga: voltou?",
+    delayMs: 1200,
+  });
+}
+
+// =====================
+// ✅ Comprovante: resolver doc sem pedir de novo
+// =====================
+async function resolveDocForReceipt({ ca, wa, analysis }) {
+  // 1) já salvo na conversa
+  const saved = getSavedDocFromCA(ca);
+  if (saved) return saved;
+
+  // 2) extraído do comprovante (se existir)
+  const fromReceipt = onlyDigits(String(analysis?.payer_doc || ""));
+  if (fromReceipt.length === 11 || fromReceipt.length === 14) return fromReceipt;
+
+  // 3) buscar no ReceitaNet pelo WhatsApp
+  if (wa) {
+    try {
+      const client = await rnFindClient({
+        baseUrl: RECEITANET_BASE_URL,
+        token: RECEITANET_TOKEN,
+        app: RECEITANET_APP,
+        phone: wa,
+      });
+      if (client?.found) {
+        const doc = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ""));
+        if (doc.length === 11 || doc.length === 14) return doc;
+      }
+    } catch {}
+  }
+
+  return "";
+}
+
+async function markNeedHuman({ conversationId, headers, reason }) {
+  await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
+  await cwSetAttrsRetry({
+    conversationId,
+    headers,
+    attrs: { bot_state: "human_needed", bot_agent: "cassia", human_reason: reason || "manual_check" },
+  });
+
+  await sendOrdered({
+    conversationId,
+    headers,
+    content:
+      "⚠️ *Sou uma atendente virtual (IA).* Não consegui confirmar o pagamento com segurança.\n" +
+      "Vou *encaminhar para um atendente humano* finalizar a conferência, tudo bem?",
     delayMs: 1200,
   });
 }
@@ -808,13 +719,13 @@ export function startServer() {
           if (isSmsnetSystemMessage(customerText)) return;
 
           let cwHeaders = await cwAuth({ force: false });
-          const conv = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
-
+          const convRes = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
+          const conv = convRes?.body || convRes; // compat
           const labels = safeLabelList(conv);
           const labelSet = new Set(labels);
 
           const ca = conv?.custom_attributes || {};
-          let state = ca.bot_state || "triage";
+          const state = ca.bot_state || "triage";
           const agent = ca.bot_agent || "isa";
 
           const waPayload = extractWhatsAppFromPayload(req.body) || normalizePhoneBR(ca.whatsapp_phone || "");
@@ -837,55 +748,24 @@ export function startServer() {
             await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { whatsapp_phone: wa } });
           }
 
-          // ✅ salvar CPF/CNPJ SEMPRE que aparecer (em qualquer estado)
-          const docInMessage = extractCpfCnpjDigits(customerText);
-          if (docInMessage) {
-            await cwSetAttrsRetry({
-              conversationId,
-              headers: cwHeaders,
-              attrs: { cpfcnpj: docInMessage, last_cpfcnpj: docInMessage },
-            });
-          }
-
           const lower = normalizeText(customerText).toLowerCase();
 
           // ============================
-          // COMANDO: #gpt_on
+          // #gpt_on
           // ============================
           if (lower === "#gpt_on") {
-            console.log("🟢 comando #gpt_on -> ativando GPT (manual)");
-
-            await cwAddLabelsMergeRetry({
-              conversationId,
-              headers: cwHeaders,
-              labels: [LABEL_GPT_ON, LABEL_GPT_MANUAL],
-            });
-
-            await cwSetAttrsRetry({
-              conversationId,
-              headers: cwHeaders,
-              attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" },
-            });
+            await cwAddLabelsMergeRetry({ conversationId, headers: cwHeaders, labels: [LABEL_GPT_ON, LABEL_GPT_MANUAL] });
+            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { gpt_on: true, bot_state: "triage", bot_agent: "isa" } });
 
             const welcomeSent = labelSet.has(LABEL_WELCOME_SENT) || ca.welcome_sent === true;
-
             if (!welcomeSent) {
-              await cwAddLabelsMergeRetry({
-                conversationId,
-                headers: cwHeaders,
-                labels: [LABEL_WELCOME_SENT],
-              });
-
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { welcome_sent: true },
-              });
+              await cwAddLabelsMergeRetry({ conversationId, headers: cwHeaders, labels: [LABEL_WELCOME_SENT] });
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { welcome_sent: true } });
 
               await sendOrdered({
                 conversationId,
                 headers: cwHeaders,
-                content: "✅ Modo teste ativado. Vou te atender por aqui.",
+                content: "✅ *Atendimento por IA ativado.* Eu sou a *Isa* (IA) da i9NET. 😊",
                 delayMs: 1200,
               });
 
@@ -893,7 +773,11 @@ export function startServer() {
                 conversationId,
                 headers: cwHeaders,
                 content:
-                  "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
+                  "Me diga o que você precisa:\n" +
+                  "1) *Sem internet / suporte*\n" +
+                  "2) *Financeiro (boleto/2ª via/pagamento)*\n" +
+                  "3) *Planos/contratar*\n\n" +
+                  "(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
                 delayMs: 1200,
               });
             }
@@ -901,11 +785,9 @@ export function startServer() {
           }
 
           // ============================
-          // COMANDO: #gpt_off
+          // #gpt_off
           // ============================
           if (lower === "#gpt_off") {
-            console.log("🔴 comando #gpt_off -> desativando GPT");
-
             await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
             await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_MANUAL });
 
@@ -917,41 +799,30 @@ export function startServer() {
                 bot_state: "triage",
                 bot_agent: "isa",
                 finance_need: null,
-                last_cpfcnpj: null,
-                last_receipt_json: null,
-                last_receipt_ts: null,
               },
             });
 
             await sendOrdered({
               conversationId,
               headers: cwHeaders,
-              content: "✅ Modo teste desativado. Voltando para o atendimento padrão do menu.",
+              content: "✅ Modo IA desativado. Voltando para o atendimento padrão.",
               delayMs: 1200,
             });
-
             return;
-          }
-
-          if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
-            await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
           }
 
           if (!gptOn) return;
 
           // ============================
-          // 🔧 CORREÇÃO: se ficou preso em finance_wait_doc e o cliente diz "oi" / "sem internet"
-          // volta pra triagem (pra não pedir CPF indevidamente)
+          // ✅ Sempre que receber CPF/CNPJ em texto: salvar
           // ============================
-          const numericChoicePre = mapNumericChoice(customerText);
-          const intentPre = detectIntent(customerText, numericChoicePre);
-          if (
-            state === "finance_wait_doc" &&
-            !extractCpfCnpjDigits(customerText) &&
-            (isGreeting(customerText) || intentPre === "support" || intentPre === "sales")
-          ) {
-            state = "triage";
-            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "triage", bot_agent: "isa" } });
+          const docInText = extractCpfCnpjDigits(customerText);
+          if (docInText) {
+            await cwSetAttrsRetry({
+              conversationId,
+              headers: cwHeaders,
+              attrs: { cpfcnpj: docInText, last_cpfcnpj: docInText },
+            });
           }
 
           // ============================
@@ -967,7 +838,6 @@ export function startServer() {
               headers: cwHeaders,
               attrs: {
                 bot_agent: "cassia",
-                bot_state: "finance_wait_doc",
                 last_attachment_url: dataUrl || "",
                 last_attachment_type: fileType,
               },
@@ -976,13 +846,7 @@ export function startServer() {
             let dl = null;
             if (dataUrl) {
               dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
-
-              console.log("📎 anexo baixado", {
-                ok: dl.ok,
-                status: dl.status,
-                bytes: dl.bytes,
-                contentType: dl.contentType,
-              });
+              console.log("📎 anexo baixado", { ok: dl.ok, status: dl.status, bytes: dl.bytes, contentType: dl.contentType });
             }
 
             // ✅ imagem -> analisar comprovante
@@ -999,10 +863,15 @@ export function startServer() {
                 attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
               });
 
-              // ✅ resolve doc sem repedir
-              const { doc } = await resolveCpfCnpj({ ca: { ...ca, ...{ cpfcnpj: docInMessage || ca.cpfcnpj } }, wa, analysis });
+              const docResolved = await resolveDocForReceipt({ ca: { ...ca, cpfcnpj: docInText || ca.cpfcnpj }, wa, analysis });
 
-              if (!doc) {
+              if (!docResolved) {
+                await cwSetAttrsRetry({
+                  conversationId,
+                  headers: cwHeaders,
+                  attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" },
+                });
+
                 await sendOrdered({
                   conversationId,
                   headers: cwHeaders,
@@ -1015,11 +884,11 @@ export function startServer() {
                 return;
               }
 
-              // ✅ persistir doc resolvido
+              // ✅ já tem doc: salva e processa sem pedir de novo
               await cwSetAttrsRetry({
                 conversationId,
                 headers: cwHeaders,
-                attrs: { cpfcnpj: doc, last_cpfcnpj: doc },
+                attrs: { cpfcnpj: docResolved, last_cpfcnpj: docResolved, bot_state: "finance_receipt_check", bot_agent: "cassia" },
               });
 
               await sendOrdered({
@@ -1028,33 +897,27 @@ export function startServer() {
                 content:
                   "📎 *Recebi seu comprovante.*\n" +
                   (analysis?.summaryText || "Consegui ler o comprovante.") +
-                  "\n\nJá localizei seu CPF/CNPJ no sistema. Vou conferir o mês correto e já te retorno. ✅",
+                  "\n\n✅ Já localizei seu CPF/CNPJ no sistema. Vou conferir o mês correto e já te retorno.",
                 delayMs: 1200,
               });
 
-              // ✅ tentar comparar comprovante com boleto em aberto (sem reenviar boleto)
-              let result = null;
-              try {
-                result = await financeSendBoletoByDoc({
-                  conversationId,
-                  headers: cwHeaders,
-                  cpfcnpj: doc,
-                  wa,
-                  silent: true,
-                  skipPreface: true,
-                });
-              } catch (e) {
-                console.log("⚠️ financeSendBoletoByDoc (silent) falhou", e?.message || e);
-                result = null;
-              }
+              // pega boleto em aberto (silencioso) e tenta match
+              const result = await financeSendBoletoByDoc({
+                conversationId,
+                headers: cwHeaders,
+                cpfcnpj: docResolved,
+                wa,
+                silent: true,
+                skipPreface: true,
+              });
 
-              if (result?.ok && result?.boleto) {
+              if (result?.ok && result?.hasOpen && result?.boleto) {
                 const match = receiptMatchesBoleto({ analysis, boleto: result.boleto });
 
                 if (match.ok) {
-                  const idCliente = String(result?.idCliente || "");
-                  if (idCliente) {
-                    try {
+                  try {
+                    const idCliente = String(result?.idCliente || "");
+                    if (idCliente) {
                       await rnNotificacaoPagamento({
                         baseUrl: RECEITANET_BASE_URL,
                         token: RECEITANET_TOKEN,
@@ -1062,142 +925,112 @@ export function startServer() {
                         idCliente,
                         contato: wa || "",
                       });
-                    } catch (e) {
-                      console.log("⚠️ rnNotificacaoPagamento falhou (ok continuar)", e?.message || e);
                     }
-                  }
+                  } catch {}
 
                   await sendOrdered({
                     conversationId,
                     headers: cwHeaders,
                     content:
-                      "✅ *Tudo certo!* O comprovante bate com a fatura em aberto.\n" +
-                      "Se foi *PIX*, a liberação costuma ser imediata. Se não liberar em alguns minutos, me avise aqui.",
+                      "✅ *Pagamento conferido!* O comprovante bate com a fatura em aberto.\n" +
+                      "Se foi *PIX*, a liberação costuma ser imediata. Se ainda não liberou, me avise aqui.",
                     delayMs: 1200,
                   });
 
                   await cwSetAttrsRetry({
                     conversationId,
                     headers: cwHeaders,
-                    attrs: { bot_state: "triage", bot_agent: "isa" },
+                    attrs: { bot_state: "triage", bot_agent: "isa", finance_need: null },
                   });
-
                   return;
                 }
 
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content:
-                    "⚠️ Recebi o comprovante, mas não consegui confirmar que ele corresponde ao *boleto em aberto* deste CPF/CNPJ.\n" +
-                    "Pode ser outro mês. Me diga *qual mês/competência* você pagou (ex: janeiro/2026) que eu ajusto.",
-                  delayMs: 1200,
-                });
-
-                await cwSetAttrsRetry({
-                  conversationId,
-                  headers: cwHeaders,
-                  attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
-                });
-
+                // ❌ não bate: humano
+                await markNeedHuman({ conversationId, headers: cwHeaders, reason: "receipt_not_match_open_boleto" });
                 return;
               }
 
-              // não achou boleto em aberto
+              // não existe boleto em aberto agora → pergunta mês pago e mantém estado financeiro
+              await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: { bot_state: "finance_wait_month", bot_agent: "cassia" },
+              });
+
               await sendOrdered({
                 conversationId,
                 headers: cwHeaders,
                 content:
                   "Entendi ✅\n" +
-                  "Não encontrei um boleto em aberto vinculado agora.\n" +
-                  "Me diga *qual mês* você pagou (ex: janeiro/2026) para eu confirmar certinho.",
+                  "No momento *não encontrei boleto em aberto* vinculado a este CPF/CNPJ.\n" +
+                  "Me diga *qual mês/competência* você pagou (ex: janeiro/2026) para eu confirmar certinho.",
                 delayMs: 1200,
-              });
-
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
               });
 
               return;
             }
 
-            // não era imagem legível / era PDF
+            // não era imagem ou não deu pra ler
             if (!customerText) {
-              // se já tem doc salvo, NÃO pedir de novo
-              const saved = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || docInMessage || ""));
-              const hasSaved = saved.length === 11 || saved.length === 14;
-
-              if (!hasSaved) {
+              const saved = getSavedDocFromCA(ca);
+              if (!saved) {
+                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
                 await sendOrdered({
                   conversationId,
                   headers: cwHeaders,
                   content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
                   delayMs: 1200,
                 });
-              } else {
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content: "📎 Recebi seu arquivo. Já tenho seu CPF/CNPJ por aqui. Vou conferir e já te retorno. ✅",
-                  delayMs: 1200,
-                });
+                return;
               }
+
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content: "📎 Recebi seu arquivo. Vou conferir no sistema pelo CPF/CNPJ já cadastrado e já retorno. ✅",
+                delayMs: 1200,
+              });
               return;
             }
           }
 
+          // ============================
+          // TRIAGEM / FLUXOS
+          // ============================
           if (!customerText && attachments.length === 0) return;
 
-          // ============================
-          // TRIAGEM
-          // ============================
+          // Estado: finance_wait_month (resposta após “não achei boleto em aberto”)
+          if (state === "finance_wait_month") {
+            // Aqui você pode implementar busca por competência.
+            // Por enquanto: humano (evita loop e confusão)
+            await markNeedHuman({ conversationId, headers: cwHeaders, reason: "need_month_check" });
+            return;
+          }
+
           const numericChoice = mapNumericChoice(customerText);
           const intent = detectIntent(customerText, numericChoice);
 
           if (state === "triage") {
             if (intent === "support") {
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { bot_agent: "anderson", bot_state: "support_check" },
-              });
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_agent: "anderson", bot_state: "support_check" } });
               await sendOrdered({
                 conversationId,
                 headers: cwHeaders,
-                content: "Certo! Eu sou o *Anderson*, do suporte. 👍\nVocê está *sem internet* agora ou está *lento/instável*?",
+                content: "Certo! Eu sou o *Anderson* (IA), do suporte. 👍\nVocê está *sem internet* agora ou está *lento/instável*?",
                 delayMs: 1200,
               });
               return;
             }
 
             if (intent === "finance") {
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" },
-              });
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_agent: "cassia", bot_state: "finance_wait_need" } });
               await sendOrdered({
                 conversationId,
                 headers: cwHeaders,
                 content:
-                  "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Responda 1/2 ou escreva “boleto” / “paguei”)",
-                delayMs: 1200,
-              });
-              return;
-            }
-
-            if (intent === "sales") {
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { bot_agent: "isa", bot_state: "sales_flow" },
-              });
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Perfeito! Me diga seu *bairro* e *cidade* para eu te informar cobertura e planos. 😊",
+                  "Oi! Eu sou a *Cássia* (IA), do financeiro. 💳\nVocê precisa de:\n" +
+                  "1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n" +
+                  "(Responda 1/2 ou escreva “boleto” / “paguei”)",
                 delayMs: 1200,
               });
               return;
@@ -1212,9 +1045,6 @@ export function startServer() {
             return;
           }
 
-          // ============================
-          // SUPORTE
-          // ============================
           if (state === "support_check") {
             await runSupportCheck({ conversationId, headers: cwHeaders, ca, wa, customerText });
             return;
@@ -1223,12 +1053,7 @@ export function startServer() {
           if (state === "support_need_doc") {
             const cpfDigits = extractCpfCnpjDigits(customerText);
             if (!cpfDigits) {
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Opa! Envie *CPF (11)* ou *CNPJ (14)*, somente números.",
-                delayMs: 1200,
-              });
+              await sendOrdered({ conversationId, headers: cwHeaders, content: "Opa! Envie *CPF (11)* ou *CNPJ (14)*, somente números.", delayMs: 1200 });
               return;
             }
 
@@ -1242,16 +1067,12 @@ export function startServer() {
             return;
           }
 
-          // ============================
-          // FINANCEIRO (Cassia)
-          // ============================
           if (state === "finance_wait_need") {
             const choice = mapNumericChoice(customerText);
-
             const need =
               choice === 1 || isBoletoIntent(customerText)
                 ? "boleto"
-                : choice === 2 || isPaymentIntent(customerText)
+                : choice === 2 || isPaymentIntent(customerText) || normalizeText(customerText).toLowerCase().includes("validar")
                 ? "comprovante"
                 : null;
 
@@ -1271,53 +1092,38 @@ export function startServer() {
               attrs: { finance_need: need, bot_state: "finance_wait_doc", bot_agent: "cassia" },
             });
 
-            // ✅ se já tiver doc salvo, não pedir novamente
-            const saved = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || docInMessage || ""));
-            const hasSaved = saved.length === 11 || saved.length === 14;
+            const savedDoc = getSavedDocFromCA(ca);
+            if (savedDoc) {
+              // ✅ já tem doc: não pede de novo, segue direto
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { cpfcnpj: savedDoc, last_cpfcnpj: savedDoc } });
 
-            if (hasSaved) {
+              if (need === "boleto") {
+                await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: savedDoc, wa, silent: false, skipPreface: false });
+                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_need", bot_agent: "cassia", finance_need: null } });
+                return;
+              }
+
               await sendOrdered({
                 conversationId,
                 headers: cwHeaders,
-                content: "Perfeito ✅ Já tenho seu CPF/CNPJ aqui. Vou consultar no sistema e já te retorno.",
+                content: "Certo. Você pode enviar o *comprovante* aqui que eu já valido pelo CPF/CNPJ cadastrado. ✅",
                 delayMs: 1200,
               });
-
-              // dispara o mesmo fluxo como se tivesse recebido doc
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: { cpfcnpj: saved, last_cpfcnpj: saved, bot_state: "finance_wait_doc", bot_agent: "cassia" },
-              });
-
-              // reaproveita abaixo (deixa seguir no próximo evento)
               return;
             }
 
-            if (need === "boleto") {
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Certo. Me envie o *CPF ou CNPJ do titular* (somente números).",
-                delayMs: 1200,
-              });
-            } else {
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Certo. Me envie o *comprovante* e o *CPF/CNPJ do titular* (somente números).",
-                delayMs: 1200,
-              });
-            }
+            // sem doc salvo
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content: "Certo. Me envie o *CPF ou CNPJ do titular* (somente números).",
+              delayMs: 1200,
+            });
             return;
           }
 
           if (state === "finance_wait_doc") {
-            // ✅ se já tem doc salvo e o cliente mandou qualquer coisa, usar o salvo
-            const saved = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || docInMessage || ""));
-            const hasSaved = saved.length === 11 || saved.length === 14;
-
-            const cpfDigits = extractCpfCnpjDigits(customerText) || (hasSaved ? saved : null);
+            const cpfDigits = extractCpfCnpjDigits(customerText) || getSavedDocFromCA(ca);
             if (!cpfDigits) {
               await sendOrdered({
                 conversationId,
@@ -1331,114 +1137,41 @@ export function startServer() {
             await cwSetAttrsRetry({
               conversationId,
               headers: cwHeaders,
-              attrs: { cpfcnpj: cpfDigits, last_cpfcnpj: cpfDigits, bot_state: "finance_handle", bot_agent: "cassia" },
+              attrs: { cpfcnpj: cpfDigits, last_cpfcnpj: cpfDigits, bot_agent: "cassia" },
             });
 
-            await sendOrdered({
-              conversationId,
-              headers: cwHeaders,
-              content: "Beleza. Vou verificar no sistema e já te retorno. ✅",
-              delayMs: 1200,
-            });
-
-            const lastReceipt = ca.last_receipt_json || null;
-
-            const result = await financeSendBoletoByDoc({
-              conversationId,
-              headers: cwHeaders,
-              cpfcnpj: cpfDigits,
-              wa,
-              silent: false,
-              skipPreface: false,
-            });
-
-            if (lastReceipt && result?.boleto) {
-              const match = receiptMatchesBoleto({ analysis: lastReceipt, boleto: result.boleto });
-
-              if (!match.ok) {
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content:
-                    "⚠️ Pelo comprovante que você enviou, *não consegui confirmar* que o pagamento corresponde a este boleto em aberto.\n" +
-                    "Pode ser que tenha sido pago um mês diferente. Se quiser, me diga valor/data que eu confiro certinho.",
-                  delayMs: 1200,
-                });
-              } else {
-                const idCliente = String(result?.idCliente || "");
-                if (idCliente) {
-                  try {
-                    await rnNotificacaoPagamento({
-                      baseUrl: RECEITANET_BASE_URL,
-                      token: RECEITANET_TOKEN,
-                      app: RECEITANET_APP,
-                      idCliente,
-                      contato: wa || "",
-                    });
-                  } catch {}
-                }
-
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content:
-                    "✅ Pelo comprovante, o pagamento *parece corresponder* ao boleto em aberto.\n" +
-                    "Se foi *PIX*, a liberação costuma ser imediata. Se foi *código de barras*, pode levar compensação.\n" +
-                    "Se não liberar em alguns minutos, me avise aqui.",
-                  delayMs: 1200,
-                });
-              }
+            const need = String(ca?.finance_need || "");
+            if (need === "boleto") {
+              await financeSendBoletoByDoc({ conversationId, headers: cwHeaders, cpfcnpj: cpfDigits, wa, silent: false, skipPreface: false });
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_need", bot_agent: "cassia", finance_need: null } });
+              return;
             }
 
-            await cwSetAttrsRetry({
-              conversationId,
-              headers: cwHeaders,
-              attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" },
-            });
-
-            return;
-          }
-
-          // ============================
-          // VENDAS
-          // ============================
-          if (state === "sales_flow") {
-            const persona = buildPersonaHeader("isa");
-            const reply = await openaiChat({
-              apiKey: OPENAI_API_KEY,
-              model: OPENAI_MODEL,
-              system: persona + "\nRegras:\n- Não envie menu numérico.\n- Seja objetiva.\n",
-              user: customerText,
-              maxTokens: 220,
-            });
-
             await sendOrdered({
               conversationId,
               headers: cwHeaders,
-              content: reply || "Certo! Me diga seu bairro e cidade para eu te passar cobertura e planos.",
+              content: "Certo ✅ Agora pode enviar o *comprovante* (foto/print) que eu valido por aqui.",
               delayMs: 1200,
             });
+            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_need", bot_agent: "cassia" } });
             return;
           }
 
           // ============================
-          // FALLBACK (GPT controlado)
+          // Fallback GPT (controlado)
           // ============================
           const persona = buildPersonaHeader(agent);
-          const reply = await openaiChat({
+          const gpt = await openaiChat({
             apiKey: OPENAI_API_KEY,
             model: OPENAI_MODEL,
-            system: persona + "\nRegras:\n- Não repetir perguntas.\n- Não confundir 1/2/3.\n",
+            system: persona + "\nRegras:\n- Não reiniciar atendimento.\n- Se já tiver CPF/CNPJ salvo, não pedir de novo.\n",
             user: customerText,
             maxTokens: 220,
           });
 
-          await sendOrdered({
-            conversationId,
-            headers: cwHeaders,
-            content: reply || "Certo! Pode me explicar um pouco melhor o que você precisa?",
-            delayMs: 1200,
-          });
+          if (gpt?.ok && gpt?.text) {
+            await sendOrdered({ conversationId, headers: cwHeaders, content: gpt.text, delayMs: 1200 });
+          }
         } catch (err) {
           console.error("❌ Erro no processamento da conversa:", err);
         }
