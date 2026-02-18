@@ -360,39 +360,90 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
-  // 1) Card resumo
+  // ============================
+  // 1️⃣ RESUMO DO BOLETO
+  // ============================
   const header = [];
   header.push("📄 *Boleto em aberto*");
   if (venc) header.push(`🗓️ *Vencimento:* ${venc}`);
   if (valor !== undefined && valor !== null && String(valor).trim() !== "") {
     header.push(`💰 *Valor:* R$ ${String(valor).replace(".", ",")}`);
   }
-  await cwSendMessageRetry({ conversationId, headers, content: header.join("\n") });
 
-  // 2) Link (1 mensagem)
+  await cwSendMessageRetry({
+    conversationId,
+    headers,
+    content: header.join("\n"),
+  });
+
+  // ============================
+  // 2️⃣ LINK
+  // ============================
   if (link) {
-    await cwSendMessageRetry({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}` });
+    await cwSendMessageRetry({
+      conversationId,
+      headers,
+      content: `🔗 *Link do boleto:*\n${link}`,
+    });
   }
 
-  // 3) Código de barras (SEPARADO EM 2 mensagens)
+  // ============================
+  // 3️⃣ CÓDIGO DE BARRAS
+  // ============================
   if (barras) {
-    await cwSendMessageRetry({ conversationId, headers, content: "🏷️ *Código de barras:* Não clique. Segure a mensagem → ⋮ → Copiar e cole no app do banco (boleto)" });
-    await cwSendMessageRetry({ conversationId, headers, content: barras });
+    // mensagem explicativa
+    await cwSendMessageRetry({
+      conversationId,
+      headers,
+      content:
+        "🏷️ *Código de barras:*\n" +
+        "Não clique.\n" +
+        "Para copiar: segure a mensagem → ⋮ → *Copiar* e cole no app do banco.",
+    });
+
+    // código separado
+    await cwSendMessageRetry({
+      conversationId,
+      headers,
+      content: barras,
+    });
   }
 
-  // 4) PIX (DEPOIS do barras) — SEPARADO em título + valor (ou partes)
+  // ============================
+  // 4️⃣ PIX
+  // ============================
   if (pix) {
-    await cwSendMessageRetry({ conversationId, headers, content: "📌 *PIX copia e cola:* Não clique. Segure a mensagem → ⋮ → Copiar e cole no app do banco (Pix copia e cola)." });
+    // mensagem explicativa
+    await cwSendMessageRetry({
+      conversationId,
+      headers,
+      content:
+        "📌 *PIX copia e cola:*\n" +
+        "Não clique.\n" +
+        "Para copiar: segure a mensagem → ⋮ → *Copiar* e cole no app do banco (Pix copia e cola).",
+    });
 
+    // chave pix separada (se for muito grande, quebra em partes)
     const parts = chunkString(pix, 1200);
+
     for (let i = 0; i < parts.length; i++) {
-      await cwSendMessageRetry({ conversationId, headers, content: parts[i] });
+      await cwSendMessageRetry({
+        conversationId,
+        headers,
+        content: parts[i],
+      });
     }
   }
 
-  // 5) PDF (1 mensagem)
+  // ============================
+  // 5️⃣ PDF
+  // ============================
   if (pdf) {
-    await cwSendMessageRetry({ conversationId, headers, content: `📎 *PDF:*\n${pdf}` });
+    await cwSendMessageRetry({
+      conversationId,
+      headers,
+      content: `📎 *PDF do boleto:*\n${pdf}`,
+    });
   }
 }
 
