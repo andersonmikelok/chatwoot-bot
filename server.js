@@ -354,6 +354,9 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
+  // ⏱️ Delay maior só aqui, pra WhatsApp não “embaralhar” (mesmo segundo)
+  const D = 900;
+
   // 1) Cabeçalho
   const header = [];
   header.push("📄 *Boleto em aberto*");
@@ -361,34 +364,34 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   if (valor !== undefined && valor !== null && String(valor).trim() !== "") {
     header.push(`💰 *Valor:* R$ ${String(valor).replace(".", ",")}`);
   }
-  await sendOrdered({ conversationId, headers, content: header.join("\n") });
+  await sendOrdered({ conversationId, headers, content: header.join("\n"), delayMs: D });
 
-  // ✅ 2) PIX primeiro: instrução (msg) + chave (uma ou várias msgs)
+  // 2) PIX (mensagem) -> 3) PIX (chave/copia e cola)
   if (pix) {
-    await sendOrdered({ conversationId, headers, content: INSTR_COPY_PIX });
+    await sendOrdered({ conversationId, headers, content: INSTR_COPY_PIX, delayMs: D });
 
     const parts = chunkString(pix, 1200);
     for (const part of parts) {
-      await sendOrdered({ conversationId, headers, content: part });
+      await sendOrdered({ conversationId, headers, content: part, delayMs: D });
     }
   }
 
-  // ✅ 3) Código de barras depois: instrução (msg) + código (msg)
+  // 4) Código de barras (mensagem) -> 5) Código de barras (linha digitável)
   if (barras) {
-    await sendOrdered({ conversationId, headers, content: INSTR_COPY_BAR });
+    await sendOrdered({ conversationId, headers, content: INSTR_COPY_BAR, delayMs: D });
 
-    // código sozinho (para copiar limpo)
-    await sendOrdered({ conversationId, headers, content: barras });
+    // linha digitável sozinha
+    await sendOrdered({ conversationId, headers, content: barras, delayMs: D });
   }
 
-  // 4) PDF (se existir)
+  // 6) PDF (se existir)
   if (pdf) {
-    await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}` });
+    await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}`, delayMs: D });
   }
 
-  // 5) LINK por último (evita o preview “subir” e bagunçar)
+  // 7) Link por último (pra evitar preview subir e bagunçar)
   if (link) {
-    await sendOrdered({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}` });
+    await sendOrdered({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}`, delayMs: D });
   }
 }
 
