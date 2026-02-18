@@ -1,4 +1,4 @@
-// server.js
+pix// server.js
 import express from "express";
 
 import {
@@ -376,13 +376,13 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
 
   // 3) Código de barras (SEPARADO EM 2 mensagens)
   if (barras) {
-    await cwSendMessageRetry({ conversationId, headers, content: "🏷️ *Código de barras:*" });
+    await cwSendMessageRetry({ conversationId, headers, content: "🏷️ *Código de barras:* Não clique. Segure a mensagem → ⋮ → Copiar e cole no app do banco (boleto)" });
     await cwSendMessageRetry({ conversationId, headers, content: barras });
   }
 
   // 4) PIX (DEPOIS do barras) — SEPARADO em título + valor (ou partes)
   if (pix) {
-    await cwSendMessageRetry({ conversationId, headers, content: "📌 *PIX copia e cola:*" });
+    await cwSendMessageRetry({ conversationId, headers, content: "📌 *PIX copia e cola:* Não clique. Segure a mensagem → ⋮ → Copiar e cole no app do banco (Pix copia e cola)." });
 
     const parts = chunkString(pix, 1200);
     for (let i = 0; i < parts.length; i++) {
