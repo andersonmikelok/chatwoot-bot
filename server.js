@@ -932,15 +932,39 @@ if (attachments.length > 0) {
         attrs: { cpfcnpj: savedDoc, last_cpfcnpj: savedDoc },
       });
 
-      await sendOrdered({
-        conversationId,
-        headers: cwHeaders,
-        content:
-          "📎 *Recebi seu comprovante.*\n" +
-          (analysis?.summaryText || "Consegui ler o comprovante.") +
-          "\n\n✅ Já localizei seu cadastro. Vou conferir se foi o *mês correto* e já te retorno.",
-        delayMs: 1200,
-      });
+      // --- INÍCIO DA ALTERAÇÃO (não pedir CPF se já estiver salvo) ---
+
+const savedDoc = onlyDigits(
+  String(ca?.cpfcnpj || ca?.last_cpfcnpj || "")
+);
+
+if (!savedDoc) {
+  await sendOrdered({
+    conversationId,
+    headers: cwHeaders,
+    content:
+      "📎 *Recebi seu comprovante.*\n" +
+      (analysis?.summaryText || "Consegui ler o comprovante.") +
+      "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+    delayMs: 1200,
+  });
+
+  return;
+}
+
+// Se já tem CPF salvo, não pede novamente
+await sendOrdered({
+  conversationId,
+  headers: cwHeaders,
+  content:
+    "📎 *Recebi seu comprovante.*\n" +
+    (analysis?.summaryText || "Consegui ler o comprovante.") +
+    "\n\nJá localizei seu CPF/CNPJ no sistema. Vou conferir o mês correto e já te retorno. ✅",
+  delayMs: 1200,
+});
+
+// --- FIM DA ALTERAÇÃO ---
+
 
       return;
     }
