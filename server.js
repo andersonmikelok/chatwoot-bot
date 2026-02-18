@@ -363,15 +363,7 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   }
   await sendOrdered({ conversationId, headers, content: header.join("\n") });
 
-  // 2) Código de barras: instrução (msg) + código (msg)
-  if (barras) {
-    await sendOrdered({ conversationId, headers, content: INSTR_COPY_BAR });
-
-    // código sozinho (para copiar limpo)
-    await sendOrdered({ conversationId, headers, content: barras });
-  }
-
-  // 3) PIX: instrução (msg) + chave (uma ou várias msgs)
+  // ✅ 2) PIX primeiro: instrução (msg) + chave (uma ou várias msgs)
   if (pix) {
     await sendOrdered({ conversationId, headers, content: INSTR_COPY_PIX });
 
@@ -379,6 +371,14 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
     for (const part of parts) {
       await sendOrdered({ conversationId, headers, content: part });
     }
+  }
+
+  // ✅ 3) Código de barras depois: instrução (msg) + código (msg)
+  if (barras) {
+    await sendOrdered({ conversationId, headers, content: INSTR_COPY_BAR });
+
+    // código sozinho (para copiar limpo)
+    await sendOrdered({ conversationId, headers, content: barras });
   }
 
   // 4) PDF (se existir)
