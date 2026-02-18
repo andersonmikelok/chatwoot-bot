@@ -337,10 +337,10 @@ async function sendOrdered({ conversationId, headers, content, delayMs = 180 }) 
 // - separa instrução e conteúdo (código e pix em mensagens próprias)
 // =====================
 const INSTR_COPY_BAR =
-  "🏷️ *Código de barras*";
+  "🏷️ *Código de barras:*";
 
 const INSTR_COPY_PIX =
-  "📌 *PIX copia e cola*";
+  "📌 *PIX copia e cola:*";
 
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
