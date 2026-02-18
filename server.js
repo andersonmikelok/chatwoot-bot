@@ -1038,4 +1038,13 @@ app.post("/api/v1/whatsapp/webhook/chatwoot", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 server on :${PORT}`));
+export function startServer() {
+  app.listen(PORT, () => console.log(`🚀 server on :${PORT}`));
+  return app;
+}
+
+// Se você rodar "node server.js" direto, ele inicia sozinho.
+// Mas quando importar (ex: index.js), só inicia via startServer().
+const isDirectRun = import.meta.url === `file://${process.argv[1]}`;
+if (isDirectRun) startServer();
+
