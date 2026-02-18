@@ -354,46 +354,53 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
-  // ⏱️ Delay maior só aqui, pra WhatsApp não “embaralhar” (mesmo segundo)
-  const D = 900;
+  // ⏱️ intervalo maior pra WhatsApp não “colar”
+  const D = 1200;
 
-  // 1) Cabeçalho
-  const header = [];
-  header.push("📄 *Boleto em aberto*");
-  if (venc) header.push(`🗓️ *Vencimento:* ${venc}`);
-  if (valor !== undefined && valor !== null && String(valor).trim() !== "") {
-    header.push(`💰 *Valor:* R$ ${String(valor).replace(".", ",")}`);
-  }
-  await sendOrdered({ conversationId, headers, content: header.join("\n"), delayMs: D });
+  // ✅ ENVIO ATÔMICO: tudo dentro de 1 fila (não intercala com outro webhook)
+  return enqueueSend(conversationId, async () => {
+    const sendNow = async (content) => {
+      await cwSendMessageRetry({ conversationId, headers, content });
+      await sleep(D);
+    };
 
-  // 2) PIX (mensagem) -> 3) PIX (chave/copia e cola)
-  if (pix) {
-    await sendOrdered({ conversationId, headers, content: INSTR_COPY_PIX, delayMs: D });
-
-    const parts = chunkString(pix, 1200);
-    for (const part of parts) {
-      await sendOrdered({ conversationId, headers, content: part, delayMs: D });
+    // 1) Cabeçalho
+    const header = [];
+    header.push("📄 *Boleto em aberto*");
+    if (venc) header.push(`🗓️ *Vencimento:* ${venc}`);
+    if (valor !== undefined && valor !== null && String(valor).trim() !== "") {
+      header.push(`💰 *Valor:* R$ ${String(valor).replace(".", ",")}`);
     }
-  }
+    await sendNow(header.join("\n"));
 
-  // 4) Código de barras (mensagem) -> 5) Código de barras (linha digitável)
-  if (barras) {
-    await sendOrdered({ conversationId, headers, content: INSTR_COPY_BAR, delayMs: D });
+    // 2) PIX (mensagem) -> 3) PIX (copia e cola)
+    if (pix) {
+      await sendNow(INSTR_COPY_PIX);
 
-    // linha digitável sozinha
-    await sendOrdered({ conversationId, headers, content: barras, delayMs: D });
-  }
+      const parts = chunkString(pix, 1200);
+      for (const part of parts) {
+        await sendNow(part);
+      }
+    }
 
-  // 6) PDF (se existir)
-  if (pdf) {
-    await sendOrdered({ conversationId, headers, content: `📎 *PDF:*\n${pdf}`, delayMs: D });
-  }
+    // 4) Código de barras (mensagem) -> 5) Linha digitável
+    if (barras) {
+      await sendNow(INSTR_COPY_BAR);
+      await sendNow(barras);
+    }
 
-  // 7) Link por último (pra evitar preview subir e bagunçar)
-  if (link) {
-    await sendOrdered({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}`, delayMs: D });
-  }
+    // 6) PDF (se existir)
+    if (pdf) {
+      await sendNow(`📎 *PDF:*\n${pdf}`);
+    }
+
+    // 7) Link por último (evita preview subir e bagunçar)
+    if (link) {
+      await sendNow(`🔗 *Link do boleto:*\n${link}`);
+    }
+  });
 }
+
 
 async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, silent = false }) {
   const waNorm = normalizePhoneBR(wa || "");
