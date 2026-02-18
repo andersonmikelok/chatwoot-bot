@@ -337,14 +337,10 @@ async function sendOrdered({ conversationId, headers, content, delayMs = 180 }) 
 // - separa instrução e conteúdo (código e pix em mensagens próprias)
 // =====================
 const INSTR_COPY_BAR =
-  "🏷️ *Código de barras*\n" +
-  "Não clique.\n" +
-  "Para copiar: segure a mensagem do código → ⋮ → *Copiar* → cole no app do banco.";
+  "🏷️ *Código de barras*";
 
 const INSTR_COPY_PIX =
-  "📌 *PIX copia e cola*\n" +
-  "Não clique.\n" +
-  "Para copiar: segure a mensagem do PIX → ⋮ → *Copiar* → cole no app do banco (Pix copia e cola).";
+  "📌 *PIX copia e cola*";
 
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
