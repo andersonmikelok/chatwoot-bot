@@ -875,76 +875,102 @@ export function startServer() {
           // ============================
           // ANEXO (imagem/pdf)
           // ============================
-          if (attachments.length > 0) {
-            const att = pickFirstAttachment(attachments);
-            const dataUrl = att?.data_url || att?.dataUrl || null;
-            const fileType = att?.file_type || att?.tipo_de_arquivo || "unknown";
+          // ============================
+// ANEXO (imagem/pdf)
+// ============================
+if (attachments.length > 0) {
+  const att = pickFirstAttachment(attachments);
+  const dataUrl = att?.data_url || att?.dataUrl || null;
+  const fileType = att?.file_type || att?.tipo_de_arquivo || "unknown";
 
-            await cwSetAttrsRetry({
-              conversationId,
-              headers: cwHeaders,
-              attrs: {
-                bot_agent: "cassia",
-                bot_state: "finance_wait_doc",
-                last_attachment_url: dataUrl || "",
-                last_attachment_type: fileType,
-              },
-            });
+  await cwSetAttrsRetry({
+    conversationId,
+    headers: cwHeaders,
+    attrs: {
+      bot_agent: "cassia",
+      bot_state: "finance_wait_doc",
+      last_attachment_url: dataUrl || "",
+      last_attachment_type: fileType,
+    },
+  });
 
-            if (dataUrl) {
-              const dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
+  // ✅ baixa o anexo antes de usar dl.ok / dl.bytes / dl.contentType
+  let dl = null;
+  if (dataUrl) {
+    dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
 
-              console.log("📎 anexo baixado", {
-                ok: dl.ok,
-                status: dl.status,
-                bytes: dl.bytes,
-                contentType: dl.contentType,
-              });
+    console.log("📎 anexo baixado", {
+      ok: dl.ok,
+      status: dl.status,
+      bytes: dl.bytes,
+      contentType: dl.contentType,
+    });
+  }
 
-              if (dl.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
-                const analysis = await openaiAnalyzeImage({
-                  apiKey: OPENAI_API_KEY,
-                  model: OPENAI_MODEL,
-                  imageDataUrl: dl.dataUri,
-                });
+  // ✅ se for imagem, tenta ler o comprovante
+  if (dl?.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
+    const analysis = await openaiAnalyzeImage({
+      apiKey: OPENAI_API_KEY,
+      model: OPENAI_MODEL,
+      imageDataUrl: dl.dataUri,
+    });
 
-                console.log("🧾 comprovante extraído (parcial)", {
-                  has: !!analysis,
-                  amount: analysis?.amount,
-                  date: analysis?.date,
-                  hasLine: !!analysis?.barcode_or_line,
-                });
+    await cwSetAttrsRetry({
+      conversationId,
+      headers: cwHeaders,
+      attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
+    });
 
-                await cwSetAttrsRetry({
-                  conversationId,
-                  headers: cwHeaders,
-                  attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
-                });
+    // --- INÍCIO DA ALTERAÇÃO (não pedir CPF/CNPJ se já tiver) ---
+    const savedDoc = onlyDigits(String(ca?.cpfcnpj || ca?.last_cpfcnpj || ""));
+    const hasSavedDoc = savedDoc.length === 11 || savedDoc.length === 14;
 
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content:
-                    "📎 *Recebi seu comprovante.*\n" +
-                    (analysis?.summaryText || "Consegui ler o comprovante.") +
-                    "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
-                  delayMs: 1200,
-                });
+    if (hasSavedDoc) {
+      await cwSetAttrsRetry({
+        conversationId,
+        headers: cwHeaders,
+        attrs: { cpfcnpj: savedDoc, last_cpfcnpj: savedDoc },
+      });
 
-                return;
-              }
-            }
+      await sendOrdered({
+        conversationId,
+        headers: cwHeaders,
+        content:
+          "📎 *Recebi seu comprovante.*\n" +
+          (analysis?.summaryText || "Consegui ler o comprovante.") +
+          "\n\n✅ Já localizei seu cadastro. Vou conferir se foi o *mês correto* e já te retorno.",
+        delayMs: 1200,
+      });
 
-            if (!customerText) {
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
-                delayMs: 1200,
-              });
-              return;
-            }
-          }
+      return;
+    }
+    // --- FIM DA ALTERAÇÃO ---
+
+    // fallback: não tinha doc salvo → pede como antes
+    await sendOrdered({
+      conversationId,
+      headers: cwHeaders,
+      content:
+        "📎 *Recebi seu comprovante.*\n" +
+        (analysis?.summaryText || "Consegui ler o comprovante.") +
+        "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+      delayMs: 1200,
+    });
+
+    return;
+  }
+
+  // se não foi possível ler como imagem (ou era PDF)
+  if (!customerText) {
+    await sendOrdered({
+      conversationId,
+      headers: cwHeaders,
+      content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
+      delayMs: 1200,
+    });
+    return;
+  }
+}
 
           if (!customerText && attachments.length === 0) return;
 
