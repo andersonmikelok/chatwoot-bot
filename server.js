@@ -116,7 +116,13 @@ function isPaymentIntent(text) {
 }
 function isBoletoIntent(text) {
   const t = normalizeText(text).toLowerCase();
-  return t.includes("boleto") || t.includes("2ª") || t.includes("2a") || t.includes("fatura") || t.includes("segunda via");
+  return (
+    t.includes("boleto") ||
+    t.includes("2ª") ||
+    t.includes("2a") ||
+    t.includes("fatura") ||
+    t.includes("segunda via")
+  );
 }
 function chunkString(str, maxLen = 1200) {
   const s = String(str || "");
@@ -332,15 +338,13 @@ async function sendOrdered({ conversationId, headers, content, delayMs = 180 }) 
 }
 
 // =====================
-// Finance helpers (mensagens copiáveis + ORDEM CORRETA)
-// - evita bagunça: LINK por último (preview do WhatsApp)
-// - separa instrução e conteúdo (código e pix em mensagens próprias)
+// Finance helpers
+// - LINK por último (preview do WhatsApp)
+// - PIX e Código de barras SEM instruções (limpos)
+// - instruções ficam somente na mensagem "Pode pagar..." após enviar tudo
 // =====================
-const INSTR_COPY_BAR =
-  "🏷️ *Código de barras:*";
-
-const INSTR_COPY_PIX =
-  "📌 *PIX copia e cola:*";
+const INSTR_COPY_BAR = "🏷️ *Código de barras:*";
+const INSTR_COPY_PIX = "📌 *PIX copia e cola:*";
 
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
@@ -369,7 +373,7 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
     }
     await sendNow(header.join("\n"));
 
-    // 2) PIX (mensagem) -> 3) PIX (copia e cola)
+    // 2) PIX (label) -> 3) PIX (copia e cola limpo)
     if (pix) {
       await sendNow(INSTR_COPY_PIX);
 
@@ -379,7 +383,7 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
       }
     }
 
-    // 4) Código de barras (mensagem) -> 5) Linha digitável
+    // 4) Código de barras (label) -> 5) Linha digitável (limpa)
     if (barras) {
       await sendNow(INSTR_COPY_BAR);
       await sendNow(barras);
@@ -390,13 +394,12 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
       await sendNow(`📎 *PDF:*\n${pdf}`);
     }
 
-    // 7) Link por último (evita preview subir e bagunçar)
+    // 7) LINK por último (evita preview subir e bagunçar)
     if (link) {
       await sendNow(`🔗 *Link do boleto:*\n${link}`);
     }
   });
 }
-
 
 async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, silent = false }) {
   const waNorm = normalizePhoneBR(wa || "");
@@ -409,7 +412,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
     phone: waNorm || "",
   });
 
-  // ❌ Cliente não encontrado
+  // ❌ não encontrado
   if (!client?.found) {
     if (!silent) {
       await sendOrdered({
@@ -420,14 +423,12 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
           "Me envie o *CPF ou CNPJ do titular do contrato* (somente números), por favor.",
       });
     }
-
     return { ok: false, reason: "not_found" };
   }
 
   const idCliente = String(client?.data?.idCliente || "").trim();
 
   // ✅ IMPORTANTE: PENDENTES primeiro (status=2), fallback para 0
-
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -464,7 +465,8 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
         conversationId,
         headers,
         content:
-          "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\nSe você já pagou, pode enviar o *comprovante* aqui que eu confirmo.",
+          "✅ Encontrei seu cadastro, mas *não consta boleto em aberto* no momento.\n" +
+          "Se você já pagou, pode enviar o *comprovante* aqui que eu confirmo.",
       });
     }
     return { ok: true, hasOpen: false, idCliente };
@@ -478,7 +480,8 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
         conversationId,
         headers,
         content:
-          "Encontrei débitos, mas não consegui montar o boleto automaticamente.\nVocê quer *2ª via do boleto* ou *validar pagamento*?",
+          "Encontrei débitos, mas não consegui montar o boleto automaticamente.\n" +
+          "Você quer *2ª via do boleto* ou *validar pagamento*?",
       });
     }
     return { ok: false, reason: "no_boleto", idCliente };
@@ -489,22 +492,30 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
   await sendOrdered({
     conversationId,
     headers,
-    content: "Perfeito 😊 Já localizei aqui.\nVou te enviar agora as informações do boleto (código de barras / PIX / link).",
+    content:
+      "Perfeito 😊 Já localizei aqui.\n" +
+      "Vou te enviar agora as informações do boleto (PIX / código de barras / link).",
   });
 
   await financeSendBoletoPieces({ conversationId, headers, boleto });
 
+  // ✅ Aqui fica a instrução (somente aqui, como você pediu)
   await sendOrdered({
     conversationId,
     headers,
-    content: "Pode pagar pela opção que for mais prática pra você 🙂\n⚡ Pagando via *PIX*, a liberação costuma ser *imediata* \n" ⚠️Não clique.\n" +
-  "Para copiar: segure a mensagem do PIX → ⋮ → *Copiar* → cole no app do banco (Pix copia e cola).",
+    content:
+      "Pode pagar pela opção que for mais prática pra você 🙂\n" +
+      "⚡ Pagando via *PIX*, a liberação costuma ser *imediata*.\n\n" +
+      "⚠️ *Não clique nos links do PIX ou código de barras!*\n" +
+      "Para copiar: segure a mensagem do PIX ou Codigo de Barras → ⋮ → *Copiar* → cole no app do banco.",
   });
 
   await sendOrdered({
     conversationId,
     headers,
-    content: "👉 Se você já realizou o pagamento, pode enviar o comprovante aqui. Vou validar o *mês correto* e agilizar! ✅",
+    content:
+      "👉 Se você já realizou o pagamento, pode enviar o comprovante aqui.\n" +
+      "Vou validar o *mês correto* e agilizar! ✅",
   });
 
   if (overdueCount > 1) {
@@ -512,7 +523,9 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
       conversationId,
       headers,
       content:
-        "⚠️ Identifiquei *mais de 1 boleto vencido*.\nPara ver e emitir todos os boletos, acesse o Portal do Assinante:\nhttps://i9net.centralassinante.com.br/",
+        "⚠️ Identifiquei *mais de 1 boleto vencido*.\n" +
+        "Para ver e emitir todos os boletos, acesse o Portal do Assinante:\n" +
+        "https://i9net.centralassinante.com.br/",
     });
   }
 
@@ -570,12 +583,14 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     await sendOrdered({
       conversationId,
       headers,
-      content: "Não consegui localizar seu cadastro pelo WhatsApp.\nMe envie o *CPF ou CNPJ do titular* (somente números), por favor.",
+      content:
+        "Não consegui localizar seu cadastro pelo WhatsApp.\n" +
+        "Me envie o *CPF ou CNPJ do titular* (somente números), por favor.",
     });
     return;
   }
 
-  // achou -> dá “boas vindas” somente se veio do WhatsApp (pra ficar humano)
+  // achou -> boas vindas
   if (foundBy === "whatsapp") {
     await sendOrdered({
       conversationId,
@@ -615,7 +630,7 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     } catch {}
   }
 
-  // 5) pendências financeiras: pega pendentes primeiro (status=2), fallback 0
+  // 5) pendências financeiras
   let debitos = [];
   try {
     debitos = await rnListDebitos({
@@ -662,7 +677,6 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
   });
 
   if (blocked) {
-    // manda para financeiro e já envia boleto
     await cwSetAttrsRetry({
       conversationId,
       headers,
@@ -673,7 +687,8 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
       conversationId,
       headers,
       content:
-        "Identifiquei aqui *bloqueio/pendência financeira* no seu cadastro.\nVou te enviar agora as opções pra regularizar. 👇",
+        "Identifiquei aqui *bloqueio/pendência financeira* no seu cadastro.\n" +
+        "Vou te enviar agora as opções pra regularizar. 👇",
     });
 
     await financeSendBoletoByDoc({ conversationId, headers, cpfcnpj: cpfUse, wa, silent: false });
@@ -803,7 +818,11 @@ export function startServer() {
             conversationId,
             headers: cwHeaders,
             content:
-              "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n1) *Sem internet / suporte*\n2) *Financeiro (boleto/2ª via/pagamento)*\n3) *Planos/contratar*\n\n(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
+              "Oi! Eu sou a *Isa*, da i9NET. 😊\nMe diga o que você precisa:\n" +
+              "1) *Sem internet / suporte*\n" +
+              "2) *Financeiro (boleto/2ª via/pagamento)*\n" +
+              "3) *Planos/contratar*\n\n" +
+              "(Se preferir, escreva: “sem internet”, “boleto”, “planos”…)",
           });
         }
 
@@ -916,7 +935,8 @@ export function startServer() {
           await sendOrdered({
             conversationId,
             headers: cwHeaders,
-            content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
+            content:
+              "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
           });
           return;
         }
@@ -955,7 +975,10 @@ export function startServer() {
             conversationId,
             headers: cwHeaders,
             content:
-              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n1) *Boleto/2ª via*\n2) *Informar pagamento / validar comprovante*\n\n(Responda 1/2 ou escreva “boleto” / “paguei”)",
+              "Oi! Eu sou a *Cassia*, do financeiro. 💳\nVocê precisa de:\n" +
+              "1) *Boleto/2ª via*\n" +
+              "2) *Informar pagamento / validar comprovante*\n\n" +
+              "(Responda 1/2 ou escreva “boleto” / “paguei”)",
           });
           return;
         }
@@ -1007,7 +1030,6 @@ export function startServer() {
           attrs: { cpfcnpj: cpfDigits, bot_state: "support_check", bot_agent: "anderson" },
         });
 
-        // ✅ continua a checagem na mesma mensagem (não espera o cliente falar “Oi”)
         await runSupportCheck({ conversationId, headers: cwHeaders, ca: { ...ca, cpfcnpj: cpfDigits }, wa, customerText });
         return;
       }
@@ -1102,14 +1124,14 @@ export function startServer() {
                 "Pode ser que tenha sido pago um mês diferente. Se quiser, reenvie o comprovante (ou me diga valor/data) que eu confiro certinho.",
             });
           } else {
-            const idCliente = String(result?.idCliente || "");
-            if (idCliente) {
+            const idCliente2 = String(result?.idCliente || "");
+            if (idCliente2) {
               try {
                 await rnNotificacaoPagamento({
                   baseUrl: RECEITANET_BASE_URL,
                   token: RECEITANET_TOKEN,
                   app: RECEITANET_APP,
-                  idCliente,
+                  idCliente: idCliente2,
                   contato: wa || "",
                 });
               } catch {}
