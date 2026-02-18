@@ -402,8 +402,15 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto, prefac
 
   // 5) LINK por último (preview bagunça timeline)
   if (link) {
-    await sendOrdered({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}`, delayMs: 1600 });
-  }
+  // ✅ Mantém clicável e geralmente impede preview (que é o que “bagunça” a ordem)
+  const url = String(link).trim();
+  await sendOrdered({
+    conversationId,
+    headers,
+    content: `🔗 *Link do boleto:*\n<${url}>`,
+    delayMs: 1600,
+  });
+}
 }
 
 async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, silent = false, skipPreface = false }) {
