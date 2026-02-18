@@ -1,4 +1,4 @@
-pix// server.js
+// server.js
 import express from "express";
 
 import {
@@ -19,7 +19,7 @@ import {
   chatwootSignInIfNeeded,
   getConversation,
   sendMessage,
-  addLabels,
+  addLabels, // ✅ MERGE seguro (não apaga labels existentes)
   addLabel,
   removeLabel,
   setCustomAttributesMerge,
@@ -56,7 +56,7 @@ const RECEITANET_APP = process.env.RECEITANET_APP || "chatbot";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
-// ✅ Anti-ordem errada no WhatsApp:
+// ✅ Anti-ordem errada no WhatsApp (fila por conversa + intervalo mínimo)
 const MIN_SEND_INTERVAL_MS = Number(process.env.MIN_SEND_INTERVAL_MS || 900);
 
 // Labels
@@ -345,13 +345,8 @@ async function cwDownloadAttachmentRetry({ headers, dataUrl }) {
 }
 
 // =====================
-// Finance helpers
+// Finance helpers (mensagens copiáveis)
 // =====================
-
-// ✅ NOVA ORDEM E SEPARAÇÃO (como você pediu)
-// - Cabeçalho "Código de barras:" numa mensagem, e o código em outra
-// - Bloco PIX vem DEPOIS do código de barras
-// - Cabeçalho "PIX copia e cola:" numa mensagem, e a chave em outra (ou partes)
 async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const venc = boleto?.vencimento || "";
   const valor = boleto?.valor;
@@ -360,38 +355,22 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
   const barras = (boleto?.barras || "").trim();
   const pdf = (boleto?.pdf || "").trim();
 
-  // ============================
-  // 1️⃣ RESUMO DO BOLETO
-  // ============================
+  // 1) Resumo
   const header = [];
   header.push("📄 *Boleto em aberto*");
   if (venc) header.push(`🗓️ *Vencimento:* ${venc}`);
   if (valor !== undefined && valor !== null && String(valor).trim() !== "") {
     header.push(`💰 *Valor:* R$ ${String(valor).replace(".", ",")}`);
   }
+  await cwSendMessageRetry({ conversationId, headers, content: header.join("\n") });
 
-  await cwSendMessageRetry({
-    conversationId,
-    headers,
-    content: header.join("\n"),
-  });
-
-  // ============================
-  // 2️⃣ LINK
-  // ============================
+  // 2) Link
   if (link) {
-    await cwSendMessageRetry({
-      conversationId,
-      headers,
-      content: `🔗 *Link do boleto:*\n${link}`,
-    });
+    await cwSendMessageRetry({ conversationId, headers, content: `🔗 *Link do boleto:*\n${link}` });
   }
 
-  // ============================
-  // 3️⃣ CÓDIGO DE BARRAS
-  // ============================
+  // 3) Código de barras (título+instrução) + barras separado
   if (barras) {
-    // mensagem explicativa
     await cwSendMessageRetry({
       conversationId,
       headers,
@@ -400,20 +379,11 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
         "Não clique.\n" +
         "Para copiar: segure a mensagem → ⋮ → *Copiar* e cole no app do banco.",
     });
-
-    // código separado
-    await cwSendMessageRetry({
-      conversationId,
-      headers,
-      content: barras,
-    });
+    await cwSendMessageRetry({ conversationId, headers, content: barras });
   }
 
-  // ============================
-  // 4️⃣ PIX
-  // ============================
+  // 4) PIX (título+instrução) + pix separado (ou em partes)
   if (pix) {
-    // mensagem explicativa
     await cwSendMessageRetry({
       conversationId,
       headers,
@@ -423,27 +393,15 @@ async function financeSendBoletoPieces({ conversationId, headers, boleto }) {
         "Para copiar: segure a mensagem → ⋮ → *Copiar* e cole no app do banco (Pix copia e cola).",
     });
 
-    // chave pix separada (se for muito grande, quebra em partes)
     const parts = chunkString(pix, 1200);
-
     for (let i = 0; i < parts.length; i++) {
-      await cwSendMessageRetry({
-        conversationId,
-        headers,
-        content: parts[i],
-      });
+      await cwSendMessageRetry({ conversationId, headers, content: parts[i] });
     }
   }
 
-  // ============================
-  // 5️⃣ PDF
-  // ============================
+  // 5) PDF
   if (pdf) {
-    await cwSendMessageRetry({
-      conversationId,
-      headers,
-      content: `📎 *PDF do boleto:*\n${pdf}`,
-    });
+    await cwSendMessageRetry({ conversationId, headers, content: `📎 *PDF do boleto:*\n${pdf}` });
   }
 }
 
@@ -549,6 +507,7 @@ async function runSupportCheck({ conversationId, headers, wa, ca, customerText, 
 
   let client = null;
 
+  // tenta por WhatsApp antes de pedir CPF
   if (wa) {
     client = await rnFindClient({
       baseUrl: RECEITANET_BASE_URL,
@@ -741,6 +700,9 @@ export function startServer() {
 
       const lower = normalizeText(customerText).toLowerCase();
 
+      // ============================
+      // COMANDO: #gpt_on
+      // ============================
       if (lower === "#gpt_on") {
         await cwAddLabelsMergeRetry({
           conversationId,
@@ -786,6 +748,9 @@ export function startServer() {
         return;
       }
 
+      // ============================
+      // COMANDO: #gpt_off
+      // ============================
       if (lower === "#gpt_off") {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_MANUAL });
@@ -813,13 +778,17 @@ export function startServer() {
         return;
       }
 
+      // limpeza de gpt_on automático
       if (labelSet.has(LABEL_GPT_ON) && !labelSet.has(LABEL_GPT_MANUAL)) {
         await cwRemoveLabelRetry({ conversationId, headers: cwHeaders, label: LABEL_GPT_ON });
       }
 
+      // GPT OFF => não responde
       if (!gptOn) return;
 
-      // anexos
+      // ============================
+      // ANEXO (imagem/pdf)
+      // ============================
       if (attachments.length > 0) {
         const att = pickFirstAttachment(attachments);
         const dataUrl = att?.data_url || att?.dataUrl || null;
@@ -877,25 +846,11 @@ export function startServer() {
 
       if (!customerText && attachments.length === 0) return;
 
+      // ============================
+      // TRIAGEM
+      // ============================
       const numericChoice = mapNumericChoice(customerText);
       const intent = detectIntent(customerText, numericChoice);
-
-      // auto-correção: "sem internet" preso no financeiro
-      if (state === "finance_wait_need" || state === "finance_wait_doc" || state === "finance_handle") {
-        if (intent === "support") {
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_agent: "anderson", bot_state: "support_check" },
-          });
-          await cwSendMessageRetry({
-            conversationId,
-            headers: cwHeaders,
-            content: "Certo! Eu sou o *Anderson*, do suporte. 👍\nVocê está *sem internet* agora ou está *lento/instável*?",
-          });
-          return;
-        }
-      }
 
       if (state === "triage") {
         if (intent === "support") {
@@ -949,7 +904,9 @@ export function startServer() {
         return;
       }
 
+      // ============================
       // SUPORTE
+      // ============================
       if (state === "support_check") {
         await runSupportCheck({ conversationId, headers: cwHeaders, wa, ca, customerText, cpfOverride: null });
         return;
@@ -983,7 +940,9 @@ export function startServer() {
         return;
       }
 
+      // ============================
       // FINANCEIRO
+      // ============================
       if (state === "finance_wait_need") {
         const choice = mapNumericChoice(customerText);
         const need =
@@ -1094,7 +1053,9 @@ export function startServer() {
         return;
       }
 
+      // ============================
       // VENDAS
+      // ============================
       if (state === "sales_flow") {
         const persona = buildPersonaHeader("isa");
         const reply = await openaiChat({
@@ -1113,7 +1074,9 @@ export function startServer() {
         return;
       }
 
+      // ============================
       // FALLBACK
+      // ============================
       const persona = buildPersonaHeader(agent);
       const reply = await openaiChat({
         apiKey: OPENAI_API_KEY,
