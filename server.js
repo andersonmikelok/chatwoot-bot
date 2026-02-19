@@ -153,23 +153,61 @@ function isSmsnetSystemMessage(text) {
   return false;
 }
 
+function normalizePixLike(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function receiptStatusOk(analysis) {
+  const st = String(analysis?.status || "").toLowerCase();
+  if (!st) return true; // se não vier, não trava (evita falso negativo)
+  if (st.includes("agend")) return false;
+  if (st.includes("pend")) return false;
+  if (st.includes("cancel")) return false;
+  if (st.includes("estorn")) return false;
+  if (st.includes("concl")) return true;
+  if (st.includes("pago")) return true;
+  if (st.includes("efetiv")) return true;
+  if (st.includes("liquid")) return true;
+  if (st.includes("baix")) return true;
+  return true;
+}
+
 function receiptMatchesBoleto({ analysis, boleto }) {
+  // Campos obrigatórios (quando disponíveis): valor, identificador, data e status
   const boletoLine = normalizeDigits(boleto?.barras || "");
   const recLine = normalizeDigits(analysis?.barcode_or_line || "");
-  const strong = boletoLine && recLine && boletoLine === recLine;
+  const strongBar = boletoLine && recLine && boletoLine === recLine;
+
+  const boletoPix = normalizePixLike(boleto?.qrcode_pix || "");
+  const recPix = normalizePixLike(analysis?.barcode_or_line || "");
+  // PIX copia e cola costuma ser longo
+  const strongPix = boletoPix && recPix && boletoPix.length > 20 && boletoPix === recPix;
 
   const boletoAmount = parseMoneyToNumber(boleto?.valor);
   const paidAmount = parseMoneyToNumber(analysis?.amount);
-
   const amountOk = amountsClose(paidAmount, boletoAmount, 0.10);
+
   const hasDate = Boolean(String(analysis?.date || "").trim());
-  const medium = amountOk && hasDate;
+  const statusOk = receiptStatusOk(analysis);
+
+  // Se o extrator conseguiu trazer beneficiário/chave, valida de forma "soft" para evitar falso negativo.
+  const benName = String(analysis?.beneficiary_name || "").trim();
+  const benKey = String(analysis?.beneficiary_key || "").trim();
+  const beneficiaryOk = benName || benKey ? true : true;
+
+  // Regra: sem identificador forte, NÃO liberar (evita regressão)
+  const identifierOk = strongBar || strongPix;
+  const ok = Boolean(statusOk && amountOk && hasDate && beneficiaryOk && identifierOk);
 
   return {
-    ok: strong || medium,
-    level: strong ? "strong" : medium ? "medium" : "none",
+    ok,
+    level: ok ? (identifierOk ? "strong" : "none") : "none",
     amountOk,
-    strong,
+    strong: identifierOk,
+    statusOk,
     boletoAmount,
     paidAmount,
   };
@@ -772,6 +810,148 @@ async function markNeedHuman({ conversationId, headers, reason }) {
   });
 }
 
+async function handoffFinanceiro({ conversationId, headers, motivo = "verificacao_comprovante" }) {
+  await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
+  await cwSetAttrsRetry({
+    conversationId,
+    headers,
+    attrs: {
+      bot_state: "handoff_financeiro",
+      bot_agent: "cassia",
+      handoff_setor: "FINANCEIRO",
+      handoff_motivo: motivo,
+    },
+  });
+
+  await sendOrdered({
+    conversationId,
+    headers,
+    content: "Recebi seu comprovante, vou encaminhar para o setor financeiro confirmar a liberação para você, tudo bem? 🙂",
+    delayMs: 1200,
+  });
+}
+
+async function handoffSuporte({ conversationId, headers, motivo = "pos_pagamento_sem_conexao" }) {
+  await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
+  await cwSetAttrsRetry({
+    conversationId,
+    headers,
+    attrs: {
+      bot_state: "handoff_suporte",
+      bot_agent: "anderson",
+      handoff_setor: "SUPORTE",
+      handoff_motivo: motivo,
+    },
+  });
+
+  await sendOrdered({
+    conversationId,
+    headers,
+    content: "Vou encaminhar seu atendimento para nossa equipe de suporte verificar a liberação para você 🙂",
+    delayMs: 1200,
+  });
+}
+
+function isPositiveConnectionReply(text) {
+  const t = normalizeText(text).toLowerCase();
+  return t.includes("voltou") || t.includes("normalizou") || t === "ok" || t.includes("funcionou") || t.includes("resolveu");
+}
+
+function isNegativeConnectionReply(text) {
+  const t = normalizeText(text).toLowerCase();
+  return (
+    t.includes("nao voltou") ||
+    t.includes("não voltou") ||
+    t.includes("ainda nao") ||
+    t.includes("ainda não") ||
+    t.includes("nao funciona") ||
+    t.includes("não funciona") ||
+    t.includes("sem internet") ||
+    t.includes("sem conex")
+  );
+}
+
+function accessIsOnline(data) {
+  const d = data && typeof data === "object" ? data : {};
+  if (typeof d.online === "boolean") return d.online;
+  if (typeof d.conectado === "boolean") return d.conectado;
+  const s = JSON.stringify(d).toLowerCase();
+  if (s.includes("offline") || s.includes("descon")) return false;
+  if (s.includes("online") || s.includes("conect")) return true;
+  return null;
+}
+
+// =====================
+// ✅ Timer de 5 minutos (background em memória)
+// =====================
+const followupTimers = new Map(); // conversationId -> timeout
+
+function clearFollowup(conversationId) {
+  const key = String(conversationId);
+  const t = followupTimers.get(key);
+  if (t) clearTimeout(t);
+  followupTimers.delete(key);
+}
+
+function scheduleFollowup5min({ conversationId, idCliente, wa }) {
+  clearFollowup(conversationId);
+  const key = String(conversationId);
+
+  const t = setTimeout(async () => {
+    try {
+      let cwHeaders = await cwAuth({ force: false });
+      const convRes = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
+      const conv = convRes?.body || convRes;
+      const ca = conv?.custom_attributes || {};
+
+      // Se o cliente já respondeu/encerrou, não faz nada
+      if (!ca?.aguardando_confirmacao_conexao) return;
+
+      // Verifica status da conexão via ReceitaNet
+      let access = null;
+      try {
+        access = await rnVerificarAcesso({
+          baseUrl: RECEITANET_BASE_URL,
+          token: RECEITANET_TOKEN,
+          app: RECEITANET_APP,
+          idCliente: String(idCliente || ca.last_idCliente || ""),
+          contato: wa || "",
+        });
+      } catch {
+        await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "falha_verificar_acesso" });
+        return;
+      }
+
+      const online = accessIsOnline(access?.data);
+      if (online === false) {
+        await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "offline_pos_liberacao" });
+        return;
+      }
+
+      if (online === true) {
+        await cwSetAttrsRetry({
+          conversationId,
+          headers: cwHeaders,
+          attrs: { bot_state: "finance_online_ask", bot_agent: "cassia" },
+        });
+        await sendOrdered({
+          conversationId,
+          headers: cwHeaders,
+          content: "Aqui no sistema sua conexão já consta normalizada ✅\nPode verificar novamente por favor?",
+          delayMs: 1200,
+        });
+        return;
+      }
+
+      await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "status_conexao_indefinido" });
+    } finally {
+      clearFollowup(conversationId);
+    }
+  }, 5 * 60 * 1000);
+
+  followupTimers.set(key, t);
+}
+
 
 // =====================
 // Server
@@ -1012,39 +1192,66 @@ export function startServer() {
                 const match = receiptMatchesBoleto({ analysis, boleto: result.boleto });
 
                 if (match.ok) {
+                  const idCliente = String(result?.idCliente || "").trim();
+                  if (!idCliente) {
+                    await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "idCliente_ausente_pos_match" });
+                    return;
+                  }
+
+                  // ✅ Sempre liberação em confiança (nunca falar automático)
                   try {
-                    const idCliente = String(result?.idCliente || "");
-                    if (idCliente) {
-                      await rnNotificacaoPagamento({
-                        baseUrl: RECEITANET_BASE_URL,
-                        token: RECEITANET_TOKEN,
-                        app: RECEITANET_APP,
-                        idCliente,
-                        contato: wa || "",
-                      });
-                    }
-                  } catch {}
+                    await rnNotificacaoPagamento({
+                      baseUrl: RECEITANET_BASE_URL,
+                      token: RECEITANET_TOKEN,
+                      app: RECEITANET_APP,
+                      idCliente,
+                      contato: wa || "",
+                    });
+                  } catch (e) {
+                    console.log("⚠️ rnNotificacaoPagamento falhou", e?.message || e);
+                    await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "falha_api_liberacao_confianca" });
+                    return;
+                  }
 
                   await sendOrdered({
                     conversationId,
                     headers: cwHeaders,
                     content:
-                      "✅ *Pagamento conferido!* O comprovante bate com a fatura em aberto.\n" +
-                      "Se foi *PIX*, a liberação costuma ser imediata. Se ainda não liberou, me avise aqui.",
+                      "Perfeito ✅ identifiquei seu pagamento.\n" +
+                      "Já solicitei a liberação do seu acesso, deve normalizar em instantes.\n" +
+                      "Se dentro de 5 minutos sua conexão não voltar, me avise aqui por favor.",
                     delayMs: 1200,
                   });
 
-                  await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "triage", bot_agent: "isa", finance_need: null } });
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: {
+                      pagamento_recebido: true,
+                      match_confirmado: true,
+                      liberacao_confianca_realizada: true,
+                      erro_liberacao_confianca: false,
+                      aguardando_confirmacao_conexao: true,
+                      aguardando_confirmacao_conexao_ts: Date.now(),
+                      last_idCliente: idCliente,
+                      bot_state: "finance_await_connection",
+                      bot_agent: "cassia",
+                      finance_need: null,
+                    },
+                  });
+
+                  // ✅ Checagem automática em 5 min se o cliente não responder
+                  scheduleFollowup5min({ conversationId, idCliente, wa });
                   return;
                 }
 
                 // ❌ não bate: humano
-                await markNeedHuman({ conversationId, headers: cwHeaders, reason: "receipt_not_match_open_boleto" });
+                await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "nao_match" });
                 return;
               }
 
               // não existe boleto em aberto agora → humano (evita loop de competência)
-              await markNeedHuman({ conversationId, headers: cwHeaders, reason: "no_open_boleto_after_receipt" });
+              await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "no_open_boleto_after_receipt" });
               return;
             }
 
@@ -1077,6 +1284,120 @@ export function startServer() {
           }
 
           if (!customerText && attachments.length === 0) return;
+
+          // ============================
+          // ✅ Pós-liberação: aguardando confirmação (PIX/Boleto)
+          // ============================
+          if (ca.bot_state === "finance_await_connection") {
+            // Cliente confirmou que voltou
+            if (isPositiveConnectionReply(customerText)) {
+              clearFollowup(conversationId);
+              await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: {
+                  aguardando_confirmacao_conexao: false,
+                  bot_state: "triage",
+                  bot_agent: "isa",
+                },
+              });
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content: "Perfeito ✅ Qualquer coisa é só chamar por aqui 🙂",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            // Se informou que ainda não voltou -> checa agora
+            if (isNegativeConnectionReply(customerText)) {
+              const idCliente = String(ca.last_idCliente || "").trim();
+              if (!idCliente) {
+                await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "idCliente_ausente_pos_liberacao" });
+                return;
+              }
+
+              let access = null;
+              try {
+                access = await rnVerificarAcesso({
+                  baseUrl: RECEITANET_BASE_URL,
+                  token: RECEITANET_TOKEN,
+                  app: RECEITANET_APP,
+                  idCliente,
+                  contato: wa || "",
+                });
+              } catch {
+                await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "falha_verificar_acesso" });
+                return;
+              }
+
+              const online = accessIsOnline(access?.data);
+              if (online === false) {
+                await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "offline_pos_liberacao" });
+                return;
+              }
+
+              if (online === true) {
+                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_online_ask", bot_agent: "cassia" } });
+                await sendOrdered({
+                  conversationId,
+                  headers: cwHeaders,
+                  content: "Aqui no sistema sua conexão já consta normalizada ✅\nPode verificar novamente por favor?",
+                  delayMs: 1200,
+                });
+                return;
+              }
+
+              await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "status_conexao_indefinido" });
+              return;
+            }
+
+            // Caso genérico
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content: "Certo 🙂 Se a conexão não normalizar em até 5 minutos, me avise aqui por favor.",
+              delayMs: 1200,
+            });
+            return;
+          }
+
+          if (ca.bot_state === "finance_online_ask") {
+            if (isPositiveConnectionReply(customerText)) {
+              clearFollowup(conversationId);
+              await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: {
+                  aguardando_confirmacao_conexao: false,
+                  bot_state: "triage",
+                  bot_agent: "isa",
+                },
+              });
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content: "Perfeito ✅ Qualquer coisa é só chamar por aqui 🙂",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            // Se ainda não funciona -> suporte
+            if (isNegativeConnectionReply(customerText) || normalizeText(customerText).toLowerCase().includes("ainda")) {
+              await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "cliente_diz_nao_funciona_mesmo_online" });
+              return;
+            }
+
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content: "Pode verificar novamente por favor? Se persistir, vou acionar nosso suporte. 🙂",
+              delayMs: 1200,
+            });
+            return;
+          }
 
           // ============================
           // TRIAGEM / FLUXOS
