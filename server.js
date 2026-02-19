@@ -1,5 +1,5 @@
 // server.js
-// BUILD_ID: fix8-2026-02-19T23:50Z
+// BUILD_ID: fix9-2026-02-19T23:05Z
 import express from "express";
 
 import {
@@ -750,15 +750,11 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
       headers,
       content:
         "No sistema seu acesso aparece *OFFLINE* (sem conexão).\n" +
-        "Vamos fazer um teste rápido para confirmar se é energia/sinal:
-" +
-        "1) Desligue a ONU/roteador por *2 minutos*
-" +
-        "2) Ligue novamente
-" +
-        "3) Aguarde *2 minutos*
-
-Depois me diga: voltou?",
+        "Vamos fazer um teste rápido para confirmar se é energia/sinal:\n" +
+        "1) Desligue a ONU/roteador por *2 minutos*\n" +
+        "2) Ligue novamente\n" +
+        "3) Aguarde *2 minutos*\n\n" +
+        "Depois me diga: voltou?",
       delayMs: 1200,
     });
     return;
