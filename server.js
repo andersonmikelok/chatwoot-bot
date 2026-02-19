@@ -35,9 +35,18 @@ import {
 } from "./lib/receitanet.js";
 
 // ✅ compat: suporta openai.js com named exports e/ou default export
-import openaiDefault, { openaiAnalyzeImage, openaiChat } from "./lib/openai.js";
+import openaiDefault, {
+  openaiAnalyzeImage,
+  openaiChat,
+  openaiClassifyImage,
+  openaiAnalyzeNetworkEquipment,
+} from "./lib/openai.js";
+
 const openaiAnalyzeImageFn = openaiAnalyzeImage || openaiDefault?.openaiAnalyzeImage;
 const openaiChatFn = openaiChat || openaiDefault?.openaiChat;
+const openaiClassifyImageFn = openaiClassifyImage || openaiDefault?.openaiClassifyImage;
+const openaiAnalyzeNetworkEquipmentFn =
+  openaiAnalyzeNetworkEquipment || openaiDefault?.openaiAnalyzeNetworkEquipment;
 
 // =====================
 // ENV
@@ -153,61 +162,23 @@ function isSmsnetSystemMessage(text) {
   return false;
 }
 
-function normalizePixLike(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function receiptStatusOk(analysis) {
-  const st = String(analysis?.status || "").toLowerCase();
-  if (!st) return true; // se não vier, não trava (evita falso negativo)
-  if (st.includes("agend")) return false;
-  if (st.includes("pend")) return false;
-  if (st.includes("cancel")) return false;
-  if (st.includes("estorn")) return false;
-  if (st.includes("concl")) return true;
-  if (st.includes("pago")) return true;
-  if (st.includes("efetiv")) return true;
-  if (st.includes("liquid")) return true;
-  if (st.includes("baix")) return true;
-  return true;
-}
-
 function receiptMatchesBoleto({ analysis, boleto }) {
-  // Campos obrigatórios (quando disponíveis): valor, identificador, data e status
   const boletoLine = normalizeDigits(boleto?.barras || "");
   const recLine = normalizeDigits(analysis?.barcode_or_line || "");
-  const strongBar = boletoLine && recLine && boletoLine === recLine;
-
-  const boletoPix = normalizePixLike(boleto?.qrcode_pix || "");
-  const recPix = normalizePixLike(analysis?.barcode_or_line || "");
-  // PIX copia e cola costuma ser longo
-  const strongPix = boletoPix && recPix && boletoPix.length > 20 && boletoPix === recPix;
+  const strong = boletoLine && recLine && boletoLine === recLine;
 
   const boletoAmount = parseMoneyToNumber(boleto?.valor);
   const paidAmount = parseMoneyToNumber(analysis?.amount);
+
   const amountOk = amountsClose(paidAmount, boletoAmount, 0.10);
-
   const hasDate = Boolean(String(analysis?.date || "").trim());
-  const statusOk = receiptStatusOk(analysis);
-
-  // Se o extrator conseguiu trazer beneficiário/chave, valida de forma "soft" para evitar falso negativo.
-  const benName = String(analysis?.beneficiary_name || "").trim();
-  const benKey = String(analysis?.beneficiary_key || "").trim();
-  const beneficiaryOk = benName || benKey ? true : true;
-
-  // Regra: sem identificador forte, NÃO liberar (evita regressão)
-  const identifierOk = strongBar || strongPix;
-  const ok = Boolean(statusOk && amountOk && hasDate && beneficiaryOk && identifierOk);
+  const medium = amountOk && hasDate;
 
   return {
-    ok,
-    level: ok ? (identifierOk ? "strong" : "none") : "none",
+    ok: strong || medium,
+    level: strong ? "strong" : medium ? "medium" : "none",
     amountOk,
-    strong: identifierOk,
-    statusOk,
+    strong,
     boletoAmount,
     paidAmount,
   };
@@ -799,176 +770,16 @@ async function markNeedHuman({ conversationId, headers, reason }) {
       ? "Financeiro"
       : "Atendimento";
 
-  // 2) mensagem de handoff (humano) — sem nome de agente
+  // 2) mensagem de handoff (humano) — padrão solicitado
   await sendOrdered({
     conversationId,
     headers,
     content:
-      `✅ Já encaminhei para o *time humano* (${sector}) finalizar a conferência.\n` +
-      "Em instantes alguém assume por aqui. Obrigado! 🙂",
+      `✅ Já encaminhei para o *time humano* (${sector}).\n\n` +
+      "você acabou de entrar em nossa fila de atendimento.\n" +
+      "Em breve um de nossos colaboradores irá te atender, por favor aguarde....",
     delayMs: 1200,
   });
-
-  await sendQueueNotice({ conversationId, headers });
-}
-
-async function sendQueueNotice({ conversationId, headers }) {
-  await sendOrdered({
-    conversationId,
-    headers,
-    content:
-      "Você acabou de entrar na nossa fila de atendimento 😊\n" +
-      "Em breve um de nossos colaboradores irá assumir sua conversa.\n\n" +
-      "Por favor, aguarde só um instante que já te atendemos.",
-    delayMs: 900,
-  });
-}
-
-
-async function handoffFinanceiro({ conversationId, headers, motivo = "verificacao_comprovante" }) {
-  await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
-  await cwSetAttrsRetry({
-    conversationId,
-    headers,
-    attrs: {
-      bot_state: "handoff_financeiro",
-      bot_agent: "cassia",
-      handoff_setor: "FINANCEIRO",
-      handoff_motivo: motivo,
-    },
-  });
-
-  await sendOrdered({
-    conversationId,
-    headers,
-    content: "Recebi seu comprovante, vou encaminhar para o setor financeiro confirmar a liberação para você, tudo bem? 🙂",
-    delayMs: 1200,
-  });
-
-  await sendQueueNotice({ conversationId, headers });
-}
-
-async function handoffSuporte({ conversationId, headers, motivo = "pos_pagamento_sem_conexao" }) {
-  await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
-  await cwSetAttrsRetry({
-    conversationId,
-    headers,
-    attrs: {
-      bot_state: "handoff_suporte",
-      bot_agent: "anderson",
-      handoff_setor: "SUPORTE",
-      handoff_motivo: motivo,
-    },
-  });
-
-  await sendOrdered({
-    conversationId,
-    headers,
-    content: "Vou encaminhar seu atendimento para nossa equipe de suporte verificar a liberação para você 🙂",
-    delayMs: 1200,
-  });
-
-  await sendQueueNotice({ conversationId, headers });
-}
-
-function isPositiveConnectionReply(text) {
-  const t = normalizeText(text).toLowerCase();
-  return t.includes("voltou") || t.includes("normalizou") || t === "ok" || t.includes("funcionou") || t.includes("resolveu");
-}
-
-function isNegativeConnectionReply(text) {
-  const t = normalizeText(text).toLowerCase();
-  return (
-    t.includes("nao voltou") ||
-    t.includes("não voltou") ||
-    t.includes("ainda nao") ||
-    t.includes("ainda não") ||
-    t.includes("nao funciona") ||
-    t.includes("não funciona") ||
-    t.includes("sem internet") ||
-    t.includes("sem conex")
-  );
-}
-
-function accessIsOnline(data) {
-  const d = data && typeof data === "object" ? data : {};
-  if (typeof d.online === "boolean") return d.online;
-  if (typeof d.conectado === "boolean") return d.conectado;
-  const s = JSON.stringify(d).toLowerCase();
-  if (s.includes("offline") || s.includes("descon")) return false;
-  if (s.includes("online") || s.includes("conect")) return true;
-  return null;
-}
-
-// =====================
-// ✅ Timer de 5 minutos (background em memória)
-// =====================
-const followupTimers = new Map(); // conversationId -> timeout
-
-function clearFollowup(conversationId) {
-  const key = String(conversationId);
-  const t = followupTimers.get(key);
-  if (t) clearTimeout(t);
-  followupTimers.delete(key);
-}
-
-function scheduleFollowup5min({ conversationId, idCliente, wa }) {
-  clearFollowup(conversationId);
-  const key = String(conversationId);
-
-  const t = setTimeout(async () => {
-    try {
-      let cwHeaders = await cwAuth({ force: false });
-      const convRes = await cwGetConversationRetry({ conversationId, headers: cwHeaders });
-      const conv = convRes?.body || convRes;
-      const ca = conv?.custom_attributes || {};
-
-      // Se o cliente já respondeu/encerrou, não faz nada
-      if (!ca?.aguardando_confirmacao_conexao) return;
-
-      // Verifica status da conexão via ReceitaNet
-      let access = null;
-      try {
-        access = await rnVerificarAcesso({
-          baseUrl: RECEITANET_BASE_URL,
-          token: RECEITANET_TOKEN,
-          app: RECEITANET_APP,
-          idCliente: String(idCliente || ca.last_idCliente || ""),
-          contato: wa || "",
-        });
-      } catch {
-        await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "falha_verificar_acesso" });
-        return;
-      }
-
-      const online = accessIsOnline(access?.data);
-      if (online === false) {
-        await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "offline_pos_liberacao" });
-        return;
-      }
-
-      if (online === true) {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_state: "finance_online_ask", bot_agent: "cassia" },
-        });
-        await sendOrdered({
-          conversationId,
-          headers: cwHeaders,
-          content: "Aqui no sistema sua conexão já consta normalizada ✅\nPode verificar novamente por favor?",
-          delayMs: 1200,
-        });
-        return;
-      }
-
-      await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "status_conexao_indefinido" });
-    } finally {
-      clearFollowup(conversationId);
-    }
-  }, 5 * 60 * 1000);
-
-  followupTimers.set(key, t);
 }
 
 
@@ -1142,15 +953,161 @@ export function startServer() {
               console.log("📎 anexo baixado", { ok: dl.ok, status: dl.status, bytes: dl.bytes, contentType: dl.contentType });
             }
 
-            // ✅ imagem -> analisar comprovante
+            // ✅ imagem -> primeiro classifica (comprovante vs equipamento)
             if (dl?.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
-              const analysis = await openaiAnalyzeImageFn({
-                apiKey: OPENAI_API_KEY,
-                model: OPENAI_MODEL,
-                imageDataUrl: dl.dataUri,
-              });
+              const classification = await (openaiClassifyImageFn
+                ? openaiClassifyImageFn({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, imageDataUrl: dl.dataUri })
+                : Promise.resolve(null));
+
+              const imgType = String(classification?.type || "other");
 
               await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: { last_image_type: imgType, last_image_conf: classification?.confidence ?? null },
+              });
+
+              // =========================
+              // FOTO DE EQUIPAMENTO (NOC)
+              // =========================
+              if (imgType === "network_equipment") {
+                // se ele não estiver em suporte ainda, entra em suporte (sem perder fluxo)
+                if (ca.bot_state === "triage") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_noc_photo" },
+                  });
+                }
+
+                const equip = await (openaiAnalyzeNetworkEquipmentFn
+                  ? openaiAnalyzeNetworkEquipmentFn({
+                      apiKey: OPENAI_API_KEY,
+                      model: OPENAI_MODEL,
+                      imageDataUrl: dl.dataUri,
+                    })
+                  : Promise.resolve(null));
+
+                await cwSetAttrsRetry({
+                  conversationId,
+                  headers: cwHeaders,
+                  attrs: { last_equipment_json: equip || null, last_equipment_ts: Date.now() },
+                });
+
+                // Se a análise disser que não está nítido
+                const summary = String(equip?.summaryText || "").trim();
+                const nextSteps = Array.isArray(equip?.next_steps) ? equip.next_steps : [];
+
+                await sendOrdered({
+                  conversationId,
+                  headers: cwHeaders,
+                  content:
+                    "🔎 *Analisando sua foto...*\n" +
+                    (summary || "Consegui identificar o estado do equipamento."),
+                  delayMs: 1200,
+                });
+
+                // Casos comuns: LOS vermelho / sem power / PON off
+                const los = String(equip?.los || "unknown");
+                const power = String(equip?.power || "unknown");
+                const pon = String(equip?.pon || "unknown");
+
+                if (power === "off") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_wait_led" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "Parece que o equipamento está *sem energia (POWER apagado)*.\n" +
+                      "✅ Confere por favor:\n" +
+                      "1) Tomada/benjamim\n2) Fonte encaixada\n3) Teste outra tomada\n\n" +
+                      "Se possível, me envie uma foto mais próxima dos LEDs ou me diga se o POWER acende.",
+                    delayMs: 1200,
+                  });
+                  return;
+                }
+
+                if (los === "red") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "los_red" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "🚨 Identifiquei *LOS vermelho*. Isso indica *perda de sinal da fibra óptica*.\n" +
+                      "Vou encaminhar para o time técnico verificar a rede/rota e, se necessário, agendar visita.",
+                    delayMs: 1200,
+                  });
+
+                  await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_los_red" });
+                  return;
+                }
+
+                if (pon === "off") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "pon_off" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "⚠️ O LED *PON parece apagado*. Pode ser *sem sincronismo* com a rede.\n" +
+                      "Vou encaminhar para o time técnico validar o sinal e autenticação do seu acesso.",
+                    delayMs: 1200,
+                  });
+
+                  await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_pon_off" });
+                  return;
+                }
+
+                // Caso geral: equipamento sincronizado, orienta testes rápidos
+                await cwSetAttrsRetry({
+                  conversationId,
+                  headers: cwHeaders,
+                  attrs: { bot_agent: "anderson", bot_state: "support_wait_feedback" },
+                });
+
+                const stepsText = nextSteps.length
+                  ? nextSteps.map((s, i) => `${i + 1}) ${s}`).join("\n")
+                  :
+                    "1) Teste desligar/ligar o roteador\n2) Teste outro aparelho\n3) Se puder, teste cabo direto";
+
+                await sendOrdered({
+                  conversationId,
+                  headers: cwHeaders,
+                  content:
+                    "✅ Pelo LED, seu equipamento parece *sincronizado*.\n" +
+                    "Vamos fazer estes testes rápidos:\n" +
+                    stepsText +
+                    "\n\nDepois me diga: *voltou?*",
+                  delayMs: 1200,
+                });
+                return;
+              }
+
+              // =========================
+              // COMPROVANTE
+              // =========================
+              if (imgType === "receipt") {
+                const analysis = await openaiAnalyzeImageFn({
+                  apiKey: OPENAI_API_KEY,
+                  model: OPENAI_MODEL,
+                  imageDataUrl: dl.dataUri,
+                });
+
+                await cwSetAttrsRetry({
                 conversationId,
                 headers: cwHeaders,
                 attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
@@ -1211,66 +1168,39 @@ export function startServer() {
                 const match = receiptMatchesBoleto({ analysis, boleto: result.boleto });
 
                 if (match.ok) {
-                  const idCliente = String(result?.idCliente || "").trim();
-                  if (!idCliente) {
-                    await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "idCliente_ausente_pos_match" });
-                    return;
-                  }
-
-                  // ✅ Sempre liberação em confiança (nunca falar automático)
                   try {
-                    await rnNotificacaoPagamento({
-                      baseUrl: RECEITANET_BASE_URL,
-                      token: RECEITANET_TOKEN,
-                      app: RECEITANET_APP,
-                      idCliente,
-                      contato: wa || "",
-                    });
-                  } catch (e) {
-                    console.log("⚠️ rnNotificacaoPagamento falhou", e?.message || e);
-                    await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "falha_api_liberacao_confianca" });
-                    return;
-                  }
+                    const idCliente = String(result?.idCliente || "");
+                    if (idCliente) {
+                      await rnNotificacaoPagamento({
+                        baseUrl: RECEITANET_BASE_URL,
+                        token: RECEITANET_TOKEN,
+                        app: RECEITANET_APP,
+                        idCliente,
+                        contato: wa || "",
+                      });
+                    }
+                  } catch {}
 
                   await sendOrdered({
                     conversationId,
                     headers: cwHeaders,
                     content:
-                      "Perfeito ✅ identifiquei seu pagamento.\n" +
-                      "Já solicitei a liberação do seu acesso, deve normalizar em instantes.\n" +
-                      "Se dentro de 5 minutos sua conexão não voltar, me avise aqui por favor.",
+                      "✅ *Pagamento conferido!* O comprovante bate com a fatura em aberto.\n" +
+                      "Se foi *PIX*, a liberação costuma ser imediata. Se ainda não liberou, me avise aqui.",
                     delayMs: 1200,
                   });
 
-                  await cwSetAttrsRetry({
-                    conversationId,
-                    headers: cwHeaders,
-                    attrs: {
-                      pagamento_recebido: true,
-                      match_confirmado: true,
-                      liberacao_confianca_realizada: true,
-                      erro_liberacao_confianca: false,
-                      aguardando_confirmacao_conexao: true,
-                      aguardando_confirmacao_conexao_ts: Date.now(),
-                      last_idCliente: idCliente,
-                      bot_state: "finance_await_connection",
-                      bot_agent: "cassia",
-                      finance_need: null,
-                    },
-                  });
-
-                  // ✅ Checagem automática em 5 min se o cliente não responder
-                  scheduleFollowup5min({ conversationId, idCliente, wa });
+                  await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "triage", bot_agent: "isa", finance_need: null } });
                   return;
                 }
 
                 // ❌ não bate: humano
-                await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "nao_match" });
+                await markNeedHuman({ conversationId, headers: cwHeaders, reason: "receipt_not_match_open_boleto" });
                 return;
               }
 
               // não existe boleto em aberto agora → humano (evita loop de competência)
-              await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "no_open_boleto_after_receipt" });
+              await markNeedHuman({ conversationId, headers: cwHeaders, reason: "no_open_boleto_after_receipt" });
               return;
             }
 
@@ -1278,7 +1208,7 @@ export function startServer() {
             if (!customerText) {
               const saved = getSavedDocFromCA(ca);
               if (!saved) {
-                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
 
                 if (shouldSendPrompt(ca, "finance_need_doc_file", 45000)) {
                   await sendOrdered({
@@ -1300,123 +1230,19 @@ export function startServer() {
               });
               return;
             }
+
+            // Se não for comprovante e não for equipamento, pede contexto (sem travar)
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "📎 Recebi sua imagem. Para eu te ajudar certinho, me diga: isso é *comprovante de pagamento* ou *foto do modem/ONU/roteador*?",
+              delayMs: 1200,
+            });
+            return;
           }
 
           if (!customerText && attachments.length === 0) return;
-
-          // ============================
-          // ✅ Pós-liberação: aguardando confirmação (PIX/Boleto)
-          // ============================
-          if (ca.bot_state === "finance_await_connection") {
-            // Cliente confirmou que voltou
-            if (isPositiveConnectionReply(customerText)) {
-              clearFollowup(conversationId);
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: {
-                  aguardando_confirmacao_conexao: false,
-                  bot_state: "triage",
-                  bot_agent: "isa",
-                },
-              });
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Perfeito ✅ Qualquer coisa é só chamar por aqui 🙂",
-                delayMs: 1200,
-              });
-              return;
-            }
-
-            // Se informou que ainda não voltou -> checa agora
-            if (isNegativeConnectionReply(customerText)) {
-              const idCliente = String(ca.last_idCliente || "").trim();
-              if (!idCliente) {
-                await handoffFinanceiro({ conversationId, headers: cwHeaders, motivo: "idCliente_ausente_pos_liberacao" });
-                return;
-              }
-
-              let access = null;
-              try {
-                access = await rnVerificarAcesso({
-                  baseUrl: RECEITANET_BASE_URL,
-                  token: RECEITANET_TOKEN,
-                  app: RECEITANET_APP,
-                  idCliente,
-                  contato: wa || "",
-                });
-              } catch {
-                await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "falha_verificar_acesso" });
-                return;
-              }
-
-              const online = accessIsOnline(access?.data);
-              if (online === false) {
-                await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "offline_pos_liberacao" });
-                return;
-              }
-
-              if (online === true) {
-                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_online_ask", bot_agent: "cassia" } });
-                await sendOrdered({
-                  conversationId,
-                  headers: cwHeaders,
-                  content: "Aqui no sistema sua conexão já consta normalizada ✅\nPode verificar novamente por favor?",
-                  delayMs: 1200,
-                });
-                return;
-              }
-
-              await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "status_conexao_indefinido" });
-              return;
-            }
-
-            // Caso genérico
-            await sendOrdered({
-              conversationId,
-              headers: cwHeaders,
-              content: "Certo 🙂 Se a conexão não normalizar em até 5 minutos, me avise aqui por favor.",
-              delayMs: 1200,
-            });
-            return;
-          }
-
-          if (ca.bot_state === "finance_online_ask") {
-            if (isPositiveConnectionReply(customerText)) {
-              clearFollowup(conversationId);
-              await cwSetAttrsRetry({
-                conversationId,
-                headers: cwHeaders,
-                attrs: {
-                  aguardando_confirmacao_conexao: false,
-                  bot_state: "triage",
-                  bot_agent: "isa",
-                },
-              });
-              await sendOrdered({
-                conversationId,
-                headers: cwHeaders,
-                content: "Perfeito ✅ Qualquer coisa é só chamar por aqui 🙂",
-                delayMs: 1200,
-              });
-              return;
-            }
-
-            // Se ainda não funciona -> suporte
-            if (isNegativeConnectionReply(customerText) || normalizeText(customerText).toLowerCase().includes("ainda")) {
-              await handoffSuporte({ conversationId, headers: cwHeaders, motivo: "cliente_diz_nao_funciona_mesmo_online" });
-              return;
-            }
-
-            await sendOrdered({
-              conversationId,
-              headers: cwHeaders,
-              content: "Pode verificar novamente por favor? Se persistir, vou acionar nosso suporte. 🙂",
-              delayMs: 1200,
-            });
-            return;
-          }
 
           // ============================
           // TRIAGEM / FLUXOS
@@ -1463,6 +1289,117 @@ export function startServer() {
           // SUPORTE
           if (ca.bot_state === "support_check") {
             await runSupportCheck({ conversationId, headers: cwHeaders, ca, wa, customerText });
+            return;
+          }
+
+          // ✅ após o teste de desligar/ligar
+          if (ca.bot_state === "support_wait_feedback") {
+            const t = normalizeText(customerText).toLowerCase();
+            const yes = t === "sim" || t.includes("voltou") || t.includes("normal") || t.includes("ok") || t.includes("funcion") || t.includes("resolveu");
+            const no = t === "nao" || t === "não" || t.includes("ainda") || t.includes("continua") || t.includes("não voltou") || t.includes("nao voltou");
+
+            if (yes) {
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "triage", bot_agent: "isa" } });
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content: "✅ Perfeito! Fico feliz que voltou.\nSe precisar de algo, é só me chamar. 🙂",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            // se for não (ou qualquer resposta), coleta LEDs
+            await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "support_wait_led", bot_agent: "anderson" } });
+
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Entendi. Vamos fazer um diagnóstico rápido estilo NOC.\n\n" +
+                "Me diga como estão as luzes do seu equipamento (se conseguir):\n" +
+                "1) *POWER* (acesa/apagada)\n" +
+                "2) *PON* (verde fixa/piscando/apagada)\n" +
+                "3) *LOS* (vermelha/apagada)\n\n" +
+                "📸 Se preferir, envie uma *foto de frente* do modem/ONU mostrando os LEDs.",
+              delayMs: 1200,
+            });
+            return;
+          }
+
+          if (ca.bot_state === "support_wait_led") {
+            const t = normalizeText(customerText).toLowerCase();
+
+            // heurística simples (sem depender de OCR)
+            const hasLosRed = t.includes("los") && (t.includes("vermel") || t.includes("red"));
+            const hasPowerOff = t.includes("power") && (t.includes("apag") || t.includes("off"));
+            const hasPonOff = t.includes("pon") && (t.includes("apag") || t.includes("off"));
+            const hasPonOk = t.includes("pon") && (t.includes("verde") || t.includes("green"));
+
+            if (hasLosRed) {
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content:
+                  "🚨 *LOS vermelho* normalmente indica *perda de sinal da fibra*.\n" +
+                  "Vou encaminhar para o time técnico verificar a rede e, se necessário, agendar visita.",
+                delayMs: 1200,
+              });
+              await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_los_red_text" });
+              return;
+            }
+
+            if (hasPowerOff) {
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content:
+                  "Se o *POWER* está apagado, o equipamento pode estar sem energia.\n" +
+                  "✅ Confira: tomada/benjamim, fonte encaixada e teste outra tomada.\n\n" +
+                  "Se puder, envie uma foto dos LEDs para eu confirmar.",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            if (hasPonOff) {
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content:
+                  "Com *PON apagado*, pode ser falta de sincronismo com a rede.\n" +
+                  "Vou encaminhar para o time técnico validar sinal/autenticação do seu acesso.",
+                delayMs: 1200,
+              });
+              await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_pon_off_text" });
+              return;
+            }
+
+            if (hasPonOk) {
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" } });
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content:
+                  "✅ Se o *PON está verde*, seu equipamento está sincronizado.\n" +
+                  "Vamos testar: \n" +
+                  "1) Teste desligar/ligar o roteador novamente\n" +
+                  "2) Teste outro aparelho\n" +
+                  "3) Se tiver como, teste *cabo direto* no computador\n\n" +
+                  "Depois me diga: *voltou?*",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            // não entendeu -> pede foto
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "Para eu te orientar com precisão, pode me enviar uma *foto de frente* do modem/ONU mostrando as luzes (POWER/PON/LOS)?",
+              delayMs: 1200,
+            });
             return;
           }
 
