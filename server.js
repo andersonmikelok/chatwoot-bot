@@ -808,7 +808,22 @@ async function markNeedHuman({ conversationId, headers, reason }) {
       "Em instantes alguém assume por aqui. Obrigado! 🙂",
     delayMs: 1200,
   });
+
+  await sendQueueNotice({ conversationId, headers });
 }
+
+async function sendQueueNotice({ conversationId, headers }) {
+  await sendOrdered({
+    conversationId,
+    headers,
+    content:
+      "Você acabou de entrar na nossa fila de atendimento 😊\n" +
+      "Em breve um de nossos colaboradores irá assumir sua conversa.\n\n" +
+      "Por favor, aguarde só um instante que já te atendemos.",
+    delayMs: 900,
+  });
+}
+
 
 async function handoffFinanceiro({ conversationId, headers, motivo = "verificacao_comprovante" }) {
   await cwAddLabelsMergeRetry({ conversationId, headers, labels: [LABEL_NEED_HUMAN] });
@@ -829,6 +844,8 @@ async function handoffFinanceiro({ conversationId, headers, motivo = "verificaca
     content: "Recebi seu comprovante, vou encaminhar para o setor financeiro confirmar a liberação para você, tudo bem? 🙂",
     delayMs: 1200,
   });
+
+  await sendQueueNotice({ conversationId, headers });
 }
 
 async function handoffSuporte({ conversationId, headers, motivo = "pos_pagamento_sem_conexao" }) {
@@ -850,6 +867,8 @@ async function handoffSuporte({ conversationId, headers, motivo = "pos_pagamento
     content: "Vou encaminhar seu atendimento para nossa equipe de suporte verificar a liberação para você 🙂",
     delayMs: 1200,
   });
+
+  await sendQueueNotice({ conversationId, headers });
 }
 
 function isPositiveConnectionReply(text) {
