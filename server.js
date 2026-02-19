@@ -573,6 +573,7 @@ async function financeSendBoletoByDoc({ conversationId, headers, cpfcnpj, wa, si
 // =====================
 async function runSupportCheck({ conversationId, headers, ca, wa, customerText }) {
   const cpfDigits = extractCpfCnpjDigits(customerText);
+  const savedDoc = getSavedDocFromCA(ca);
 
   let client = null;
 
@@ -590,19 +591,21 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     }
   }
 
-  // 2) se não achou e veio CPF/CNPJ, tenta por doc e salva
-  if ((!client || !client.found) && cpfDigits) {
+  // 2) se não achou, tenta por CPF/CNPJ (do texto) ou pelo CPF/CNPJ já salvo na conversa
+  const docToTry = cpfDigits || savedDoc;
+  if ((!client || !client.found) && docToTry) {
     try {
       client = await rnFindClient({
         baseUrl: RECEITANET_BASE_URL,
         token: RECEITANET_TOKEN,
         app: RECEITANET_APP,
-        cpfcnpj: cpfDigits,
+        cpfcnpj: docToTry,
       });
-    } catch {
+      await cwSetAttrsRetry({ conversationId, headers, attrs: { cpfcnpj: docToTry, last_cpfcnpj: docToTry } });
+    } catch (e) {
+      console.warn("⚠️ rnFindClient por CPF/CNPJ falhou", e?.message || e);
       client = null;
     }
-    await cwSetAttrsRetry({ conversationId, headers, attrs: { cpfcnpj: cpfDigits, last_cpfcnpj: cpfDigits } });
   }
 
   // 3) se ainda não achou, pede CPF/CNPJ (anti-spam)
@@ -631,8 +634,11 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
   const cpfUse = onlyDigits(String(client?.data?.cpfCnpj || client?.data?.cpfcnpj || ca.cpfcnpj || ""));
   const idCliente = String(client?.data?.idCliente || "").trim();
 
-  // 4) verifica bloqueio no endpoint de acesso (se possível)
+  // 4) verifica status/bloqueio no endpoint de acesso (se possível)
   let blockedByAcesso = false;
+  let isOffline = false;
+  let acessoInfo = null;
+
   if (idCliente && wa) {
     try {
       const acesso = await rnVerificarAcesso({
@@ -642,13 +648,30 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
         idCliente,
         contato: wa,
       });
+
       const a = acesso?.data || {};
+      acessoInfo = a;
+
+      const situ = String(a?.situacao || a?.status || a?.estado || "").toLowerCase();
+      isOffline =
+        a?.online === false ||
+        a?.statusOnline === false ||
+        situ.includes("offline") ||
+        situ.includes("off-line") ||
+        situ.includes("sem sinal") ||
+        situ.includes("sem conex") ||
+        situ.includes("desconect");
+
       blockedByAcesso =
         a?.bloqueado === true ||
         a?.liberado === false ||
-        String(a?.situacao || "").toLowerCase().includes("bloque") ||
-        String(a?.status || "").toLowerCase().includes("bloque");
-    } catch {}
+        situ.includes("bloque") ||
+        situ.includes("suspens") ||
+        situ.includes("inadimpl");
+    } catch (e) {
+      // se cair aqui, seguimos sem travar o fluxo
+      console.warn("⚠️ rnVerificarAcesso falhou", e?.message || e);
+    }
   }
 
   // 5) pendências financeiras
@@ -685,20 +708,87 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
   const { boleto: overdueBoleto } = pickBestOverdueBoleto(list);
 
   const hasPendencia = Boolean(overdueBoleto);
-  const blocked = blockedByAcesso || hasPendencia;
 
-  if (blocked) {
+  // ✅ Regras de decisão (evita falso positivo de "bloqueio"):
+  // - Só afirma "bloqueio" quando o endpoint de acesso indicar bloqueado/suspenso.
+  // - Se apenas existir boleto em aberto, tratamos como "pode estar relacionado" (sem afirmar bloqueio).
+  // - Se o status estiver OFFLINE, priorizamos suporte/NOC antes de jogar para financeiro.
+
+  if (blockedByAcesso) {
     // ✅ joga pro financeiro SEM perder o CPF (salva + muda estado)
     await cwSetAttrsRetry({
       conversationId,
       headers,
-      attrs: { bot_agent: "cassia", bot_state: "finance_wait_need", cpfcnpj: cpfUse, last_cpfcnpj: cpfUse, finance_need: "boleto" },
+      attrs: {
+        bot_agent: "cassia",
+        bot_state: "finance_wait_need",
+        cpfcnpj: cpfUse,
+        last_cpfcnpj: cpfUse,
+        finance_need: "boleto",
+      },
     });
 
     await sendOrdered({
       conversationId,
       headers,
-      content: "Identifiquei aqui *bloqueio/pendência financeira* no seu cadastro.\nVou te enviar agora as opções pra regularizar. 👇",
+      content:
+        "Identifiquei aqui um *bloqueio/suspensão* no seu cadastro (pode ser por financeiro).
+" +
+        "Vou te enviar agora as opções pra regularizar. 👇",
+      delayMs: 1200,
+    });
+
+    await financeSendBoletoByDoc({ conversationId, headers, cpfcnpj: cpfUse, wa, silent: false, skipPreface: true });
+    return;
+  }
+
+  // Se estiver OFFLINE e não há bloqueio pelo acesso, vai para suporte
+  if (isOffline) {
+    await cwSetAttrsRetry({ conversationId, headers, attrs: { bot_state: "support_wait_feedback", bot_agent: "anderson" } });
+
+    await sendOrdered({
+      conversationId,
+      headers,
+      content:
+        "No sistema seu acesso aparece *OFFLINE* (sem conexão).
+" +
+        "Vamos fazer um teste rápido para confirmar se é energia/sinal:
+" +
+        "1) Desligue a ONU/roteador por *2 minutos*
+" +
+        "2) Ligue novamente
+" +
+        "3) Aguarde *2 minutos*
+
+Depois me diga: voltou?",
+      delayMs: 1200,
+    });
+    return;
+  }
+
+  // Se existir boleto em aberto, avisa sem afirmar bloqueio (mais seguro)
+  if (hasPendencia) {
+    await cwSetAttrsRetry({
+      conversationId,
+      headers,
+      attrs: {
+        bot_agent: "cassia",
+        bot_state: "finance_wait_need",
+        cpfcnpj: cpfUse,
+        last_cpfcnpj: cpfUse,
+        finance_need: "boleto",
+      },
+    });
+
+    await sendOrdered({
+      conversationId,
+      headers,
+      content:
+        "Encontrei um *boleto em aberto* no seu cadastro.
+" +
+        "Em alguns casos isso pode afetar a conexão. Vou te enviar as opções para regularizar.
+" +
+        "👉 Se você já pagou, envie o *comprovante* aqui.",
       delayMs: 1200,
     });
 
@@ -939,318 +1029,315 @@ export function startServer() {
           }
 
           // ============================
-// ANEXO (imagem/pdf)
-// ============================
-if (attachments.length > 0) {
-  const att = pickFirstAttachment(attachments);
-  const dataUrl = att?.data_url || att?.dataUrl || null;
-  const fileType = att?.file_type || att?.tipo_de_arquivo || "unknown";
+          // ANEXO (imagem/pdf)
+          // ============================
+          if (attachments.length > 0) {
+            const att = pickFirstAttachment(attachments);
+            const dataUrl = att?.data_url || att?.dataUrl || null;
+            const fileType = att?.file_type || att?.tipo_de_arquivo || "unknown";
 
-  await cwSetAttrsRetry({
-    conversationId,
-    headers: cwHeaders,
-    attrs: { bot_agent: "cassia", last_attachment_url: dataUrl || "", last_attachment_type: fileType },
-  });
+            await cwSetAttrsRetry({
+              conversationId,
+              headers: cwHeaders,
+              attrs: { bot_agent: "cassia", last_attachment_url: dataUrl || "", last_attachment_type: fileType },
+            });
 
-  let dl = null;
-  if (dataUrl) {
-    dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
-    console.log("📎 anexo baixado", {
-      ok: dl?.ok,
-      status: dl?.status,
-      bytes: dl?.bytes,
-      contentType: dl?.contentType,
-    });
-  }
-
-  // ✅ imagem -> primeiro classifica (comprovante vs equipamento)
-  if (dl?.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
-    const classification = await (openaiClassifyImageFn
-      ? openaiClassifyImageFn({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, imageDataUrl: dl.dataUri })
-      : Promise.resolve(null));
-
-    const imgType = String(classification?.type || "other");
-
-    await cwSetAttrsRetry({
-      conversationId,
-      headers: cwHeaders,
-      attrs: { last_image_type: imgType, last_image_conf: classification?.confidence ?? null },
-    });
-
-    // =========================
-    // FOTO DE EQUIPAMENTO (NOC)
-    // =========================
-    if (imgType === "network_equipment") {
-      if (ca.bot_state === "triage") {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_agent: "anderson", bot_state: "support_noc_photo" },
-        });
-      }
-
-      const equip = await (openaiAnalyzeNetworkEquipmentFn
-        ? openaiAnalyzeNetworkEquipmentFn({
-            apiKey: OPENAI_API_KEY,
-            model: OPENAI_MODEL,
-            imageDataUrl: dl.dataUri,
-          })
-        : Promise.resolve(null));
-
-      await cwSetAttrsRetry({
-        conversationId,
-        headers: cwHeaders,
-        attrs: { last_equipment_json: equip || null, last_equipment_ts: Date.now() },
-      });
-
-      const summary = String(equip?.summaryText || "").trim();
-      const nextSteps = Array.isArray(equip?.next_steps) ? equip.next_steps : [];
-
-      await sendOrdered({
-        conversationId,
-        headers: cwHeaders,
-        content: "🔎 *Analisando sua foto...*\n" + (summary || "Consegui identificar o estado do equipamento."),
-        delayMs: 1200,
-      });
-
-      const los = String(equip?.los || "unknown");
-      const power = String(equip?.power || "unknown");
-      const pon = String(equip?.pon || "unknown");
-
-      if (power === "off") {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_agent: "anderson", bot_state: "support_wait_led" },
-        });
-
-        await sendOrdered({
-          conversationId,
-          headers: cwHeaders,
-          content:
-            "Parece que o equipamento está *sem energia (POWER apagado)*.\n" +
-            "✅ Confere por favor:\n" +
-            "1) Tomada/benjamim\n2) Fonte encaixada\n3) Teste outra tomada\n\n" +
-            "Se possível, me envie uma foto mais próxima dos LEDs ou me diga se o POWER acende.",
-          delayMs: 1200,
-        });
-        return;
-      }
-
-      if (los === "red") {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "los_red" },
-        });
-
-        await sendOrdered({
-          conversationId,
-          headers: cwHeaders,
-          content:
-            "🚨 Identifiquei *LOS vermelho*. Isso indica *perda de sinal da fibra óptica*.\n" +
-            "Vou encaminhar para o time técnico verificar a rede/rota e, se necessário, agendar visita.",
-          delayMs: 1200,
-        });
-
-        await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_los_red" });
-        return;
-      }
-
-      if (pon === "off") {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "pon_off" },
-        });
-
-        await sendOrdered({
-          conversationId,
-          headers: cwHeaders,
-          content:
-            "⚠️ O LED *PON parece apagado*. Pode ser *sem sincronismo* com a rede.\n" +
-            "Vou encaminhar para o time técnico validar o sinal e autenticação do seu acesso.",
-          delayMs: 1200,
-        });
-
-        await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_pon_off" });
-        return;
-      }
-
-      await cwSetAttrsRetry({
-        conversationId,
-        headers: cwHeaders,
-        attrs: { bot_agent: "anderson", bot_state: "support_wait_feedback" },
-      });
-
-      const stepsText = nextSteps.length
-        ? nextSteps.map((s, i) => `${i + 1}) ${s}`).join("\n")
-        : "1) Teste desligar/ligar o roteador\n2) Teste outro aparelho\n3) Se puder, teste cabo direto";
-
-      await sendOrdered({
-        conversationId,
-        headers: cwHeaders,
-        content:
-          "✅ Pelo LED, seu equipamento parece *sincronizado*.\n" +
-          "Vamos fazer estes testes rápidos:\n" +
-          stepsText +
-          "\n\nDepois me diga: *voltou?*",
-        delayMs: 1200,
-      });
-      return;
-    }
-
-    // =========================
-    // COMPROVANTE
-    // =========================
-    if (imgType === "receipt") {
-      const analysis = await openaiAnalyzeImageFn({
-        apiKey: OPENAI_API_KEY,
-        model: OPENAI_MODEL,
-        imageDataUrl: dl.dataUri,
-      });
-
-      await cwSetAttrsRetry({
-        conversationId,
-        headers: cwHeaders,
-        attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
-      });
-
-      const docResolved = await resolveDocForReceipt({
-        ca: { ...ca, cpfcnpj: docInText || ca.cpfcnpj },
-        wa,
-        analysis,
-      });
-
-      if (!docResolved) {
-        await cwSetAttrsRetry({
-          conversationId,
-          headers: cwHeaders,
-          attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" },
-        });
-
-        if (shouldSendPrompt(ca, "finance_need_doc_receipt", 45000)) {
-          await sendOrdered({
-            conversationId,
-            headers: cwHeaders,
-            content:
-              "📎 *Recebi seu comprovante.*\n" +
-              (analysis?.summaryText || "Consegui ler o comprovante.") +
-              "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
-            delayMs: 1200,
-          });
-          await markPromptSent({ conversationId, headers: cwHeaders, key: "finance_need_doc_receipt" });
-        }
-        return;
-      }
-
-      await cwSetAttrsRetry({
-        conversationId,
-        headers: cwHeaders,
-        attrs: { cpfcnpj: docResolved, last_cpfcnpj: docResolved, bot_state: "finance_receipt_check", bot_agent: "cassia" },
-      });
-
-      await sendOrdered({
-        conversationId,
-        headers: cwHeaders,
-        content:
-          "📎 *Recebi seu comprovante.*\n" +
-          (analysis?.summaryText || "Consegui ler o comprovante.") +
-          "\n\n✅ Já localizei seu CPF/CNPJ no sistema. Vou conferir o mês correto e já te retorno.",
-        delayMs: 1200,
-      });
-
-      const result = await financeSendBoletoByDoc({
-        conversationId,
-        headers: cwHeaders,
-        cpfcnpj: docResolved,
-        wa,
-        silent: true,
-        skipPreface: true,
-      });
-
-      if (result?.ok && result?.hasOpen && result?.boleto) {
-        const match = receiptMatchesBoleto({ analysis, boleto: result.boleto });
-
-        if (match.ok) {
-          try {
-            const idCliente = String(result?.idCliente || "");
-            if (idCliente) {
-              await rnNotificacaoPagamento({
-                baseUrl: RECEITANET_BASE_URL,
-                token: RECEITANET_TOKEN,
-                app: RECEITANET_APP,
-                idCliente,
-                contato: wa || "",
-              });
+            let dl = null;
+            if (dataUrl) {
+              dl = await cwDownloadAttachmentRetry({ headers: cwHeaders, dataUrl });
+              console.log("📎 anexo baixado", { ok: dl.ok, status: dl.status, bytes: dl.bytes, contentType: dl.contentType });
             }
-          } catch {}
 
-          await sendOrdered({
-            conversationId,
-            headers: cwHeaders,
-            content:
-              "✅ *Pagamento conferido!* O comprovante bate com a fatura em aberto.\n" +
-              "Se foi *PIX*, a liberação costuma ser imediata. Se ainda não liberou, me avise aqui.",
-            delayMs: 1200,
-          });
+            // ✅ imagem -> primeiro classifica (comprovante vs equipamento)
+            if (dl?.ok && dl.bytes <= 4 * 1024 * 1024 && (dl.contentType || "").startsWith("image/")) {
+              const classification = await (openaiClassifyImageFn
+                ? openaiClassifyImageFn({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, imageDataUrl: dl.dataUri })
+                : Promise.resolve(null));
 
-          await cwSetAttrsRetry({
-            conversationId,
-            headers: cwHeaders,
-            attrs: { bot_state: "triage", bot_agent: "isa", finance_need: null },
-          });
-          return;
-        }
+              const imgType = String(classification?.type || "other");
 
-        await markNeedHuman({ conversationId, headers: cwHeaders, reason: "receipt_not_match_open_boleto" });
-        return;
-      }
+              await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: { last_image_type: imgType, last_image_conf: classification?.confidence ?? null },
+              });
 
-      await markNeedHuman({ conversationId, headers: cwHeaders, reason: "no_open_boleto_after_receipt" });
-      return;
-    }
+              // =========================
+              // FOTO DE EQUIPAMENTO (NOC)
+              // =========================
+              if (imgType === "network_equipment") {
+                // se ele não estiver em suporte ainda, entra em suporte (sem perder fluxo)
+                if (ca.bot_state === "triage") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_noc_photo" },
+                  });
+                }
 
-    // Não é comprovante nem equipamento -> pede contexto
-    await sendOrdered({
-      conversationId,
-      headers: cwHeaders,
-      content: "📎 Recebi sua imagem. Para eu te ajudar certinho, me diga: isso é *comprovante de pagamento* ou *foto do modem/ONU/roteador*?",
-      delayMs: 1200,
-    });
-    return;
-  }
+                const equip = await (openaiAnalyzeNetworkEquipmentFn
+                  ? openaiAnalyzeNetworkEquipmentFn({
+                      apiKey: OPENAI_API_KEY,
+                      model: OPENAI_MODEL,
+                      imageDataUrl: dl.dataUri,
+                    })
+                  : Promise.resolve(null));
 
-  // não era imagem legível / outro tipo de arquivo
-  if (!customerText) {
-    const saved = getSavedDocFromCA(ca);
-    if (!saved) {
-      await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
+                await cwSetAttrsRetry({
+                  conversationId,
+                  headers: cwHeaders,
+                  attrs: { last_equipment_json: equip || null, last_equipment_ts: Date.now() },
+                });
 
-      if (shouldSendPrompt(ca, "finance_need_doc_file", 45000)) {
-        await sendOrdered({
-          conversationId,
-          headers: cwHeaders,
-          content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
-          delayMs: 1200,
-        });
-        await markPromptSent({ conversationId, headers: cwHeaders, key: "finance_need_doc_file" });
-      }
-      return;
-    }
+                // Se a análise disser que não está nítido
+                const summary = String(equip?.summaryText || "").trim();
+                const nextSteps = Array.isArray(equip?.next_steps) ? equip.next_steps : [];
 
-    await sendOrdered({
-      conversationId,
-      headers: cwHeaders,
-      content: "📎 Recebi seu arquivo. Vou conferir no sistema pelo CPF/CNPJ já cadastrado e já retorno. ✅",
-      delayMs: 1200,
-    });
-    return;
-  }
+                await sendOrdered({
+                  conversationId,
+                  headers: cwHeaders,
+                  content:
+                    "🔎 *Analisando sua foto...*\n" +
+                    (summary || "Consegui identificar o estado do equipamento."),
+                  delayMs: 1200,
+                });
 
-  return;
-}
+                // Casos comuns: LOS vermelho / sem power / PON off
+                const los = String(equip?.los || "unknown");
+                const power = String(equip?.power || "unknown");
+                const pon = String(equip?.pon || "unknown");
 
+                if (power === "off") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_wait_led" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "Parece que o equipamento está *sem energia (POWER apagado)*.\n" +
+                      "✅ Confere por favor:\n" +
+                      "1) Tomada/benjamim\n2) Fonte encaixada\n3) Teste outra tomada\n\n" +
+                      "Se possível, me envie uma foto mais próxima dos LEDs ou me diga se o POWER acende.",
+                    delayMs: 1200,
+                  });
+                  return;
+                }
+
+                if (los === "red") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "los_red" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "🚨 Identifiquei *LOS vermelho*. Isso indica *perda de sinal da fibra óptica*.\n" +
+                      "Vou encaminhar para o time técnico verificar a rede/rota e, se necessário, agendar visita.",
+                    delayMs: 1200,
+                  });
+
+                  await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_los_red" });
+                  return;
+                }
+
+                if (pon === "off") {
+                  await cwSetAttrsRetry({
+                    conversationId,
+                    headers: cwHeaders,
+                    attrs: { bot_agent: "anderson", bot_state: "support_need_human", support_reason: "pon_off" },
+                  });
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "⚠️ O LED *PON parece apagado*. Pode ser *sem sincronismo* com a rede.\n" +
+                      "Vou encaminhar para o time técnico validar o sinal e autenticação do seu acesso.",
+                    delayMs: 1200,
+                  });
+
+                  await markNeedHuman({ conversationId, headers: cwHeaders, reason: "support_pon_off" });
+                  return;
+                }
+
+                // Caso geral: equipamento sincronizado, orienta testes rápidos
+                await cwSetAttrsRetry({
+                  conversationId,
+                  headers: cwHeaders,
+                  attrs: { bot_agent: "anderson", bot_state: "support_wait_feedback" },
+                });
+
+                const stepsText = nextSteps.length
+                  ? nextSteps.map((s, i) => `${i + 1}) ${s}`).join("\n")
+                  :
+                    "1) Teste desligar/ligar o roteador\n2) Teste outro aparelho\n3) Se puder, teste cabo direto";
+
+                await sendOrdered({
+                  conversationId,
+                  headers: cwHeaders,
+                  content:
+                    "✅ Pelo LED, seu equipamento parece *sincronizado*.\n" +
+                    "Vamos fazer estes testes rápidos:\n" +
+                    stepsText +
+                    "\n\nDepois me diga: *voltou?*",
+                  delayMs: 1200,
+                });
+                return;
+              }
+
+              // =========================
+              // COMPROVANTE
+              // =========================
+              if (imgType === "receipt") {
+                const analysis = await openaiAnalyzeImageFn({
+                  apiKey: OPENAI_API_KEY,
+                  model: OPENAI_MODEL,
+                  imageDataUrl: dl.dataUri,
+                });
+
+                await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: { last_receipt_json: analysis || null, last_receipt_ts: Date.now() },
+              });
+
+              const docResolved = await resolveDocForReceipt({
+                ca: { ...ca, cpfcnpj: docInText || ca.cpfcnpj },
+                wa,
+                analysis,
+              });
+
+              if (!docResolved) {
+                await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
+
+                if (shouldSendPrompt(ca, "finance_need_doc_receipt", 45000)) {
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "📎 *Recebi seu comprovante.*\n" +
+                      (analysis?.summaryText || "Consegui ler o comprovante.") +
+                      "\n\nPara eu conferir se foi o *mês correto* no sistema, me envie o *CPF ou CNPJ do titular* (somente números).",
+                    delayMs: 1200,
+                  });
+                  await markPromptSent({ conversationId, headers: cwHeaders, key: "finance_need_doc_receipt" });
+                }
+                return;
+              }
+
+              // ✅ doc ok: salva e processa sem pedir de novo
+              await cwSetAttrsRetry({
+                conversationId,
+                headers: cwHeaders,
+                attrs: { cpfcnpj: docResolved, last_cpfcnpj: docResolved, bot_state: "finance_receipt_check", bot_agent: "cassia" },
+              });
+
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content:
+                  "📎 *Recebi seu comprovante.*\n" +
+                  (analysis?.summaryText || "Consegui ler o comprovante.") +
+                  "\n\n✅ Já localizei seu CPF/CNPJ no sistema. Vou conferir o mês correto e já te retorno.",
+                delayMs: 1200,
+              });
+
+              // pega boleto em aberto (silencioso) e tenta match
+              const result = await financeSendBoletoByDoc({
+                conversationId,
+                headers: cwHeaders,
+                cpfcnpj: docResolved,
+                wa,
+                silent: true,
+                skipPreface: true,
+              });
+
+              if (result?.ok && result?.hasOpen && result?.boleto) {
+                const match = receiptMatchesBoleto({ analysis, boleto: result.boleto });
+
+                if (match.ok) {
+                  try {
+                    const idCliente = String(result?.idCliente || "");
+                    if (idCliente) {
+                      await rnNotificacaoPagamento({
+                        baseUrl: RECEITANET_BASE_URL,
+                        token: RECEITANET_TOKEN,
+                        app: RECEITANET_APP,
+                        idCliente,
+                        contato: wa || "",
+                      });
+                    }
+                  } catch {}
+
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content:
+                      "✅ *Pagamento conferido!* O comprovante bate com a fatura em aberto.\n" +
+                      "Se foi *PIX*, a liberação costuma ser imediata. Se ainda não liberou, me avise aqui.",
+                    delayMs: 1200,
+                  });
+
+                  await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "triage", bot_agent: "isa", finance_need: null } });
+                  return;
+                }
+
+                // ❌ não bate: humano
+                await markNeedHuman({ conversationId, headers: cwHeaders, reason: "receipt_not_match_open_boleto" });
+                return;
+              }
+
+              // não existe boleto em aberto agora → humano (evita loop de competência)
+              await markNeedHuman({ conversationId, headers: cwHeaders, reason: "no_open_boleto_after_receipt" });
+              return;
+            }
+
+            // não era imagem ou não deu pra ler
+            if (!customerText) {
+              const saved = getSavedDocFromCA(ca);
+              if (!saved) {
+              await cwSetAttrsRetry({ conversationId, headers: cwHeaders, attrs: { bot_state: "finance_wait_doc", bot_agent: "cassia" } });
+
+                if (shouldSendPrompt(ca, "finance_need_doc_file", 45000)) {
+                  await sendOrdered({
+                    conversationId,
+                    headers: cwHeaders,
+                    content: "📎 Recebi seu arquivo. Me envie o *CPF ou CNPJ do titular* (somente números) para eu localizar no sistema.",
+                    delayMs: 1200,
+                  });
+                  await markPromptSent({ conversationId, headers: cwHeaders, key: "finance_need_doc_file" });
+                }
+                return;
+              }
+
+              await sendOrdered({
+                conversationId,
+                headers: cwHeaders,
+                content: "📎 Recebi seu arquivo. Vou conferir no sistema pelo CPF/CNPJ já cadastrado e já retorno. ✅",
+                delayMs: 1200,
+              });
+              return;
+            }
+
+            // Se não for comprovante e não for equipamento, pede contexto (sem travar)
+            await sendOrdered({
+              conversationId,
+              headers: cwHeaders,
+              content:
+                "📎 Recebi sua imagem. Para eu te ajudar certinho, me diga: isso é *comprovante de pagamento* ou *foto do modem/ONU/roteador*?",
+              delayMs: 1200,
+            });
+            return;
+          }
+
+          if (!customerText && attachments.length === 0) return;
 
           // ============================
           // TRIAGEM / FLUXOS
