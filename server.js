@@ -1,5 +1,5 @@
 // server.js
-// BUILD_ID: fix7-2026-02-19T23:30Z
+// BUILD_ID: fix8-2026-02-19T23:50Z
 import express from "express";
 
 import {
@@ -732,8 +732,7 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
       conversationId,
       headers,
       content:
-        "Identifiquei aqui um *bloqueio/suspensão* no seu cadastro (pode ser por financeiro).
-" +
+        "Identifiquei aqui um *bloqueio/suspensão* no seu cadastro (pode ser por financeiro).\n" +
         "Vou te enviar agora as opções pra regularizar. 👇",
       delayMs: 1200,
     });
@@ -750,8 +749,7 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
       conversationId,
       headers,
       content:
-        "No sistema seu acesso aparece *OFFLINE* (sem conexão).
-" +
+        "No sistema seu acesso aparece *OFFLINE* (sem conexão).\n" +
         "Vamos fazer um teste rápido para confirmar se é energia/sinal:
 " +
         "1) Desligue a ONU/roteador por *2 minutos*
@@ -784,8 +782,7 @@ Depois me diga: voltou?",
       conversationId,
       headers,
       content:
-        "Encontrei um *boleto em aberto* no seu cadastro.
-" +
+        "Encontrei um *boleto em aberto* no seu cadastro.\n" +
         "Em alguns casos isso pode afetar a conexão. Vou te enviar as opções para regularizar.
 " +
         "👉 Se você já pagou, envie o *comprovante* aqui.",
