@@ -731,8 +731,9 @@ async function runSupportCheck({ conversationId, headers, ca, wa, customerText }
     await sendOrdered({
       conversationId,
       headers,
-      content: `Identifiquei aqui um *bloqueio/suspensão* no seu cadastro (pode ser por financeiro).
-Vou te enviar agora as opções pra regularizar. 👇`,
+      content:
+        "Identifiquei aqui um *bloqueio/suspensão* no seu cadastro (pode ser por financeiro).\n" +
+        "Vou te enviar agora as opções pra regularizar. 👇",
       delayMs: 1200,
     });
 
@@ -747,13 +748,13 @@ Vou te enviar agora as opções pra regularizar. 👇`,
     await sendOrdered({
       conversationId,
       headers,
-      content: `No sistema seu acesso aparece *OFFLINE* (sem conexão).
-Vamos fazer um teste rápido para confirmar se é energia/sinal:
-1) Desligue a ONU/roteador por *2 minutos*
-2) Ligue novamente
-3) Aguarde *2 minutos*
-
-Depois me diga: voltou?`,
+      content:
+        "No sistema seu acesso aparece *OFFLINE* (sem conexão).\n" +
+        "Vamos fazer um teste rápido para confirmar se é energia/sinal:\n" +
+        "1) Desligue a ONU/roteador por *2 minutos*\n" +
+        "2) Ligue novamente\n" +
+        "3) Aguarde *2 minutos*\n\n" +
+        "Depois me diga: voltou?",
       delayMs: 1200,
     });
     return;
@@ -776,9 +777,10 @@ Depois me diga: voltou?`,
     await sendOrdered({
       conversationId,
       headers,
-      content: `Encontrei um *boleto em aberto* no seu cadastro.
-Em alguns casos isso pode afetar a conexão. Vou te enviar as opções para regularizar.
-👉 Se você já pagou, envie o *comprovante* aqui.`,
+      content:
+        "Encontrei um *boleto em aberto* no seu cadastro.\n" +
+        "Em alguns casos isso pode afetar a conexão. Vou te enviar as opções para regularizar.\n" +
+        "👉 Se você já pagou, envie o *comprovante* aqui.",
       delayMs: 1200,
     });
 
